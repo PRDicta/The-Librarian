@@ -33,7 +33,3 @@ Everything stays on your machine. The rolodex is a local SQLite file. No data le
 ## License
 
 Proprietary. Copyright (c) 2026 Dicta Technologies Inc. All rights reserved. See [LICENSE](plugins/the-librarian/LICENSE) for terms.
-
----
-
-Built by [Dicta](https://usedicta.com)
