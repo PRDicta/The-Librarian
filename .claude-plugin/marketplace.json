@@ -1,8 +1,7 @@
 {
   "name": "The-Librarian",
   "owner": {
-    "name": "Dicta Technologies Inc.",
-    "email": "philip@usedicta.com"
+    "name": "Dicta Technologies Inc."
   },
   "metadata": {
     "description": "Persistent memory for Claude — file indexing, conversation recall, and context management."
@@ -16,7 +15,6 @@
       "author": {
         "name": "Dicta Technologies Inc."
       },
-      "homepage": "https://usedicta.com",
       "license": "Proprietary",
       "keywords": ["memory", "context", "persistence", "knowledge-base", "indexing", "recall"],
       "category": "productivity"
