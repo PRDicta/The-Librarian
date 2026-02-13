@@ -9,6 +9,10 @@
 - **Smart retrieval**: Hybrid search (keyword + semantic) finds relevant context when you need it, even across sessions.
 - **Context window management**: Keeps Claude's active context lean by safely offloading older content to the rolodex, retrievable on demand.
 
+## Prerequisites
+
+The Librarian runs inside the Claude environment (Cowork or Claude Code), which includes Python out of the box. All Python dependencies are installed automatically when you run `/librarian-start` — no manual setup required.
+
 ## Getting started
 
 After installing the plugin, run:
@@ -41,6 +45,6 @@ Content is chunked intelligently based on its type (prose, code, structured data
 
 Everything stays on your machine. The rolodex is a local SQLite file. No data is sent to external services beyond the normal Claude conversation. The only API calls are to Anthropic's models (which you're already using).
 
-## Author
+## License
 
-Built by [Dicta](https://usedicta.com).
+Proprietary — see [LICENSE](LICENSE) for details.
