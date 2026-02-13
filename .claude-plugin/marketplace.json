@@ -4,13 +4,13 @@
     "name": "Dicta Technologies Inc."
   },
   "metadata": {
-    "description": "Persistent memory for Claude — file indexing, conversation recall, and context management."
+    "description": "Stop re-explaining your project every session. Persistent memory for Claude — 100% local, zero configuration."
   },
   "plugins": [
     {
       "name": "the-librarian",
       "source": "./plugins/the-librarian",
-      "description": "Persistent memory across sessions. The Librarian indexes your files and conversations into a local SQLite rolodex — what you told Claude last week is still there.",
+      "description": "Persistent memory across sessions. The Librarian indexes your files and conversations into a local SQLite rolodex — what you told Claude last week is still there. Works immediately at install, no API key required.",
       "version": "0.1.0",
       "author": {
         "name": "Dicta Technologies Inc."
