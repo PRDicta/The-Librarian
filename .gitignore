@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.env
+.cowork_session
+rolodex.db
+rolodex.db-wal
+rolodex.db-shm
+.fuse_hidden*
+.DS_Store
+Thumbs.db
