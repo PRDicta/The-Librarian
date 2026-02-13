@@ -16,7 +16,9 @@ Run the install script to ensure all Python dependencies are present:
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/install.sh"
 ```
 
-If this fails, tell the user which packages are missing and how to install them manually.
+The script outputs JSON. Check the `status` field:
+- `"ok"` → dependencies are ready, continue to Step 2
+- `"error"` → show the user the `message` field, which contains specific guidance (e.g., "Python is not installed" or which packages failed). Do not proceed until dependencies are resolved.
 
 ## Step 2: Boot The Librarian
 
