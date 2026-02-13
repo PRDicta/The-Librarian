@@ -3,9 +3,8 @@
   "version": "0.1.0",
   "description": "Persistent memory across sessions. The Librarian indexes your files and conversations into a local SQLite rolodex — what you told Claude last week is still there.",
   "author": {
-    "name": "Dicta"
+    "name": "Dicta Technologies Inc."
   },
-  "homepage": "https://usedicta.com",
   "license": "Proprietary",
   "keywords": ["memory", "context", "persistence", "knowledge-base", "indexing", "recall"]
 }
