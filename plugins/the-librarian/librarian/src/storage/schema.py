@@ -1,6 +1,8 @@
-
-
-
+"""
+The Librarian — Database Schema
+SQLite table definitions, initialization, and serialization helpers.
+All conversation content is stored verbatim — no compression, ever.
+"""
 import sqlite3
 import json
 import struct
@@ -10,7 +12,7 @@ from pathlib import Path
 from ..core.types import (
     RolodexEntry, ContentModality, EntryCategory, Tier
 )
-
+# ─── Schema SQL ──────────────────────────────────────────────────────────────
 SCHEMA_SQL = """
 -- Core rolodex entries: every piece of indexed content
 CREATE TABLE IF NOT EXISTS rolodex_entries (
@@ -168,44 +170,85 @@ CREATE TABLE IF NOT EXISTS user_profile (
     source_session TEXT,
     updated_at DATETIME NOT NULL
 );
+
+-- Phase 10: Boot manifest — pre-computed context plan, refined each session
+CREATE TABLE IF NOT EXISTS boot_manifest (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    source_session_id TEXT,
+    manifest_type TEXT NOT NULL,
+    total_token_cost INTEGER NOT NULL,
+    entry_count INTEGER NOT NULL,
+    topic_summary TEXT DEFAULT '{}',
+    metadata TEXT DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_updated
+    ON boot_manifest(updated_at DESC);
+
+-- Phase 10: Manifest entries — ranked content selections for boot context
+CREATE TABLE IF NOT EXISTS manifest_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    manifest_id INTEGER NOT NULL,
+    entry_id TEXT NOT NULL,
+    composite_score REAL NOT NULL,
+    token_cost INTEGER NOT NULL,
+    topic_label TEXT,
+    selection_reason TEXT NOT NULL,
+    was_accessed INTEGER DEFAULT 0,
+    slot_rank INTEGER NOT NULL,
+    FOREIGN KEY (manifest_id) REFERENCES boot_manifest(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_entries_manifest
+    ON manifest_entries(manifest_id);
+CREATE INDEX IF NOT EXISTS idx_manifest_entries_entry
+    ON manifest_entries(entry_id);
 """
-
+# ─── Database Initialization ─────────────────────────────────────────────────
 def init_database(db_path: str) -> sqlite3.Connection:
-
-
+    """
+    Create database and tables if they don't exist.
+    Returns an open connection.
+    """
+    # Ensure directory exists
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=WAL")      # Better concurrent read/write
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-
+    # Phase 4: safely extend conversations table for existing databases
     _safe_add_columns(conn)
     return conn
 
 
 def _safe_add_columns(conn: sqlite3.Connection):
-
+    """Add new columns to existing tables (idempotent)."""
     additions = [
-
+        # Phase 4: conversation metadata
         ("conversations", "summary", "TEXT DEFAULT ''"),
         ("conversations", "last_active", "DATETIME"),
         ("conversations", "message_count", "INTEGER DEFAULT 0"),
-
+        # Phase 8: topic assignment on entries
         ("rolodex_entries", "topic_id", "TEXT"),
+        # Corrections: track superseded entries
         ("rolodex_entries", "superseded_by", "TEXT"),
+        # Verbatim source flag: TRUE = original user/assistant text, FALSE = assistant summary/paraphrase
+        ("rolodex_entries", "verbatim_source", "INTEGER DEFAULT 1"),
     ]
     for table, column, col_type in additions:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
             conn.commit()
         except sqlite3.OperationalError:
-            pass
-
+            pass  # Column already exists — that's fine
+# ─── Serialization ───────────────────────────────────────────────────────────
 def serialize_entry(entry: RolodexEntry) -> tuple:
-
+    """Convert RolodexEntry to a tuple for SQL INSERT."""
     return (
         entry.id,
         entry.conversation_id,
@@ -223,7 +266,7 @@ def serialize_entry(entry: RolodexEntry) -> tuple:
         json.dumps(entry.metadata),
     )
 def deserialize_entry(row: sqlite3.Row) -> RolodexEntry:
-
+    """Convert a database row back to a RolodexEntry."""
     return RolodexEntry(
         id=row["id"],
         conversation_id=row["conversation_id"],
@@ -245,11 +288,12 @@ def deserialize_entry(row: sqlite3.Row) -> RolodexEntry:
         ),
         linked_ids=json.loads(row["linked_ids"]) if row["linked_ids"] else [],
         metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+        verbatim_source=bool(row["verbatim_source"]) if "verbatim_source" in row.keys() else True,
     )
 def serialize_embedding(embedding: List[float]) -> bytes:
-
+    """Pack a float list into compact binary (float32)."""
     return struct.pack(f"{len(embedding)}f", *embedding)
 def deserialize_embedding(blob: bytes) -> List[float]:
-
-    count = len(blob) // 4
+    """Unpack binary back to float list."""
+    count = len(blob) // 4  # 4 bytes per float32
     return list(struct.unpack(f"{count}f", blob))

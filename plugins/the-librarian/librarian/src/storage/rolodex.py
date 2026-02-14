@@ -1,6 +1,8 @@
-
-
-
+"""
+The Librarian — Rolodex Storage Layer
+SQLite-backed storage with full-text search and vector similarity.
+All content stored verbatim. No compression, no summarization.
+"""
 import sqlite3
 import json
 import uuid
@@ -18,16 +20,19 @@ from .schema import (
     serialize_embedding, deserialize_embedding
 )
 class Rolodex:
-
-
+    """
+    The Librarian's indexed catalog of all conversation content.
+    Implements CRUD operations, full-text keyword search, and
+    vector similarity search.
+    """
     def __init__(self, db_path: str = "rolodex.db"):
         self.db_path = db_path
         self.conn = init_database(db_path)
         self._hot_cache: OrderedDict[str, RolodexEntry] = OrderedDict()
         self._hot_cache_max = 50
-
+    # ─── Write Operations ────────────────────────────────────────────────
     def create_entry(self, entry: RolodexEntry) -> str:
-
+        """Store a new entry. Returns the entry ID."""
         values = serialize_entry(entry)
         self.conn.execute(
             """INSERT INTO rolodex_entries
@@ -37,17 +42,22 @@ class Rolodex:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             values
         )
-
+        # Update FTS index
         self.conn.execute(
             "INSERT INTO rolodex_fts (entry_id, content, tags, category) VALUES (?, ?, ?, ?)",
             (entry.id, entry.content, json.dumps(entry.tags), entry.category.value)
         )
+        # Write verbatim_source flag (migration-added column)
+        self.conn.execute(
+            "UPDATE rolodex_entries SET verbatim_source = ? WHERE id = ?",
+            (1 if entry.verbatim_source else 0, entry.id)
+        )
         self.conn.commit()
-
+        # Add to hot cache (most recent entries are likely to be needed)
         self._cache_put(entry)
         return entry.id
     def batch_create_entries(self, entries: List[RolodexEntry]) -> List[str]:
-
+        """Bulk insert entries. Returns list of IDs."""
         ids = []
         for entry in entries:
             values = serialize_entry(entry)
@@ -68,7 +78,7 @@ class Rolodex:
         self.conn.commit()
         return ids
     def update_access(self, entry_id: str) -> None:
-
+        """Increment access count and update last_accessed timestamp."""
         now = datetime.utcnow().isoformat()
         self.conn.execute(
             """UPDATE rolodex_entries
@@ -77,13 +87,13 @@ class Rolodex:
             (now, entry_id)
         )
         self.conn.commit()
-
+        # Update hot cache if present — refresh LRU position
         if entry_id in self._hot_cache:
             entry = self._hot_cache[entry_id]
             entry.access_count += 1
             entry.last_accessed = datetime.utcnow()
-            self._hot_cache.move_to_end(entry_id)
-
+            self._hot_cache.move_to_end(entry_id)  # Phase 2: refresh LRU
+    # ─── Enrichment Updates (Phase 8) ────────────────────────────────────
 
     def update_entry_enrichment(
         self,
@@ -94,8 +104,10 @@ class Rolodex:
         embedding: Optional[List[float]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-
-
+        """
+        Update a stub entry with enriched data from background processing.
+        Only updates non-None fields. Used by IngestionQueue workers.
+        """
         updates = []
         params = []
 
@@ -108,7 +120,7 @@ class Rolodex:
         if tags is not None:
             updates.append("tags = ?")
             params.append(json.dumps(tags))
-
+            # Also update FTS index
             self.conn.execute(
                 "UPDATE rolodex_fts SET tags = ? WHERE entry_id = ?",
                 (json.dumps(tags), entry_id)
@@ -117,7 +129,7 @@ class Rolodex:
             updates.append("embedding = ?")
             params.append(serialize_embedding(embedding))
         if metadata is not None:
-
+            # Merge with existing metadata
             row = self.conn.execute(
                 "SELECT metadata FROM rolodex_entries WHERE id = ?",
                 (entry_id,)
@@ -135,7 +147,7 @@ class Rolodex:
         sql = f"UPDATE rolodex_entries SET {', '.join(updates)} WHERE id = ?"
         self.conn.execute(sql, params)
 
-
+        # Update FTS category if changed
         if category is not None:
             self.conn.execute(
                 "UPDATE rolodex_fts SET category = ? WHERE entry_id = ?",
@@ -144,7 +156,7 @@ class Rolodex:
 
         self.conn.commit()
 
-
+        # Update hot cache if present
         if entry_id in self._hot_cache:
             entry = self._hot_cache[entry_id]
             if content_type is not None:
@@ -163,16 +175,16 @@ class Rolodex:
         entry_id: str,
         metadata: Dict[str, Any],
     ) -> None:
-
+        """Update only the metadata field of an entry (merge with existing)."""
         self.update_entry_enrichment(entry_id=entry_id, metadata=metadata)
 
-
+    # ─── Read Operations ─────────────────────────────────────────────────
     def get_entry(self, entry_id: str) -> Optional[RolodexEntry]:
-
-
+        """Fetch a single entry by ID. Checks hot cache first."""
+        # Hot cache check
         if entry_id in self._hot_cache:
             return self._hot_cache[entry_id]
-
+        # Cold storage
         row = self.conn.execute(
             "SELECT * FROM rolodex_entries WHERE id = ?", (entry_id,)
         ).fetchone()
@@ -182,11 +194,17 @@ class Rolodex:
     def keyword_search(
         self, query: str, limit: int = 5, conversation_id: Optional[str] = None
     ) -> List[Tuple[RolodexEntry, float]]:
+        """
+        Full-text search via FTS5.
+        Returns list of (entry, rank_score) tuples, best first.
 
-
+        When the default AND query (all terms required) returns nothing,
+        falls back to OR (any term matches) for better recall.
+        """
+        # Try full AND query first (FTS5 default: all terms must match)
         results = self._fts_match(query, limit, conversation_id)
 
-
+        # If no results and query has multiple words, try OR fallback
         if not results and ' ' in query.strip():
             fts_operators = {'AND', 'OR', 'NOT', 'NEAR'}
             terms = [
@@ -202,13 +220,12 @@ class Rolodex:
     def _fts_match(
         self, fts_query: str, limit: int, conversation_id: Optional[str] = None
     ) -> List[Tuple[RolodexEntry, float]]:
-
+        """Execute a single FTS5 MATCH query."""
         sql = """
             SELECT re.*, fts.rank
             FROM rolodex_fts fts
             JOIN rolodex_entries re ON re.id = fts.entry_id
             WHERE rolodex_fts MATCH ?
-            AND re.superseded_by IS NULL
         """
         params: list = [fts_query]
         if conversation_id:
@@ -220,8 +237,8 @@ class Rolodex:
         results = []
         for row in rows:
             entry = deserialize_entry(row)
-
-
+            # FTS5 rank is negative (more negative = better match)
+            # Normalize to 0-1 where 1 is best
             score = min(1.0, abs(row["rank"]) / 10.0)
             results.append((entry, score))
         return results
@@ -232,15 +249,18 @@ class Rolodex:
         min_similarity: float = 0.3,
         conversation_id: Optional[str] = None
     ) -> List[Tuple[RolodexEntry, float]]:
-
-
-        sql = "SELECT * FROM rolodex_entries WHERE embedding IS NOT NULL AND superseded_by IS NULL"
+        """
+        Vector similarity search using cosine similarity.
+        Returns list of (entry, similarity_score) tuples, best first.
+        """
+        # Fetch all entries with embeddings
+        sql = "SELECT * FROM rolodex_entries WHERE embedding IS NOT NULL"
         params: list = []
         if conversation_id:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
         rows = self.conn.execute(sql, params).fetchall()
-
+        # Compute similarities
         scored = []
         for row in rows:
             entry = deserialize_entry(row)
@@ -248,7 +268,7 @@ class Rolodex:
                 sim = _cosine_similarity(query_embedding, entry.embedding)
                 if sim >= min_similarity:
                     scored.append((entry, sim))
-
+        # Sort by similarity descending
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:limit]
     def hybrid_search(
@@ -261,30 +281,32 @@ class Rolodex:
         min_similarity: float = 0.3,
         conversation_id: Optional[str] = None
     ) -> List[Tuple[RolodexEntry, float]]:
-
-
+        """
+        Combined keyword + semantic search with configurable weights.
+        Returns merged, deduplicated results scored by weighted combination.
+        """
         keyword_results = []
         semantic_results = []
-
+        # Keyword search
         try:
             keyword_results = self.keyword_search(
                 query, limit=limit * 2, conversation_id=conversation_id
             )
         except Exception:
-            pass
-
+            pass  # FTS might fail on some query formats
+        # Semantic search (if embedding provided)
         if query_embedding:
             semantic_results = self.semantic_search(
                 query_embedding, limit=limit * 2,
                 min_similarity=min_similarity,
                 conversation_id=conversation_id
             )
-
+        # Merge results
         return _merge_search_results(
             keyword_results, semantic_results,
             keyword_weight, semantic_weight, limit
         )
-
+    # ─── Cross-Session Search (Phase 4) ─────────────────────────────────
 
     def boosted_hybrid_search(
         self,
@@ -297,22 +319,28 @@ class Rolodex:
         semantic_weight: float = 0.6,
         min_similarity: float = 0.3,
     ) -> List[Tuple[RolodexEntry, float]]:
+        """
+        Cross-session hybrid search with current-session boosting.
 
-
+        Searches ALL entries (no conversation_id filter), then boosts
+        scores for entries from the current session. This prioritizes
+        recent context while still surfacing knowledge from past sessions.
+        """
+        # Search globally (conversation_id=None)
         results = self.hybrid_search(
             query=query,
             query_embedding=query_embedding,
-            limit=limit * 2,
+            limit=limit * 2,  # Over-fetch to account for re-ranking
             keyword_weight=keyword_weight,
             semantic_weight=semantic_weight,
             min_similarity=min_similarity,
-            conversation_id=None,
+            conversation_id=None,  # Search ALL sessions
         )
 
         if not current_session_id or boost_factor <= 1.0:
             return results[:limit]
 
-
+        # Boost current-session entries
         boosted = []
         for entry, score in results:
             if entry.conversation_id == current_session_id:
@@ -320,22 +348,22 @@ class Rolodex:
             else:
                 boosted.append((entry, score))
 
-
+        # Re-sort by boosted score
         boosted.sort(key=lambda x: x[1], reverse=True)
         return boosted[:limit]
 
+    # ─── Topic-Scoped Search (Phase 8) ──────────────────────────────────
 
     def keyword_search_by_topic(
         self, query: str, topic_id: str, limit: int = 5
     ) -> List[Tuple[RolodexEntry, float]]:
-
+        """Keyword search scoped to a specific topic."""
         sql = """
             SELECT re.*, fts.rank
             FROM rolodex_fts fts
             JOIN rolodex_entries re ON re.id = fts.entry_id
             WHERE rolodex_fts MATCH ?
             AND re.topic_id = ?
-            AND re.superseded_by IS NULL
             ORDER BY fts.rank LIMIT ?
         """
         rows = self.conn.execute(sql, (query, topic_id, limit)).fetchall()
@@ -345,7 +373,7 @@ class Rolodex:
             score = min(1.0, abs(row["rank"]) / 10.0)
             results.append((entry, score))
 
-
+        # OR fallback
         if not results and ' ' in query.strip():
             fts_operators = {'AND', 'OR', 'NOT', 'NEAR'}
             terms = [
@@ -369,11 +397,10 @@ class Rolodex:
         limit: int = 5,
         min_similarity: float = 0.3,
     ) -> List[Tuple[RolodexEntry, float]]:
-
+        """Semantic search scoped to a specific topic."""
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE embedding IS NOT NULL AND topic_id = ?
-               AND superseded_by IS NULL""",
+               WHERE embedding IS NOT NULL AND topic_id = ?""",
             (topic_id,)
         ).fetchall()
         scored = []
@@ -396,7 +423,7 @@ class Rolodex:
         semantic_weight: float = 0.6,
         min_similarity: float = 0.3,
     ) -> List[Tuple[RolodexEntry, float]]:
-
+        """Combined keyword + semantic search scoped to a topic."""
         keyword_results = []
         semantic_results = []
         try:
@@ -418,8 +445,8 @@ class Rolodex:
     def get_entries_by_category(
         self, category: str, conversation_id: Optional[str] = None, limit: int = 20
     ) -> List[RolodexEntry]:
-
-        sql = "SELECT * FROM rolodex_entries WHERE category = ? AND superseded_by IS NULL"
+        """Fetch entries filtered by category."""
+        sql = "SELECT * FROM rolodex_entries WHERE category = ?"
         params: list = [category]
         if conversation_id:
             sql += " AND conversation_id = ?"
@@ -431,20 +458,20 @@ class Rolodex:
     def get_recent_entries(
         self, conversation_id: str, limit: int = 20
     ) -> List[RolodexEntry]:
-
+        """Fetch most recently created entries for a conversation."""
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE conversation_id = ? AND superseded_by IS NULL
+               WHERE conversation_id = ?
                ORDER BY created_at DESC LIMIT ?""",
             (conversation_id, limit)
         ).fetchall()
         return [deserialize_entry(row) for row in rows]
-
+    # ─── Hot Cache ───────────────────────────────────────────────────────
     def get_hot_cache_entries(self) -> List[RolodexEntry]:
-
+        """Return all entries currently in the hot cache."""
         return list(self._hot_cache.values())
     def search_hot_cache(self, query: str) -> List[RolodexEntry]:
-
+        """Simple keyword match against hot cache entries."""
         query_lower = query.lower()
         results = []
         for entry in self._hot_cache.values():
@@ -454,12 +481,12 @@ class Rolodex:
                 results.append(entry)
         return results
     def _cache_put(self, entry: RolodexEntry):
-
+        """Add entry to hot cache with LRU eviction."""
         self._hot_cache[entry.id] = entry
         self._hot_cache.move_to_end(entry.id)
         while len(self._hot_cache) > self._hot_cache_max:
             self._hot_cache.popitem(last=False)
-
+    # ─── Tier Management (Phase 2) ───────────────────────────────────────
 
     def evaluate_tier(
         self,
@@ -469,8 +496,10 @@ class Rolodex:
         recency_half_life: float = 24.0,
         age_boost_half_life: float = 48.0,
     ) -> Tuple[Tier, float]:
-
-
+        """
+        Compute importance score for an entry and return recommended tier.
+        Does NOT mutate — caller decides whether to act on the recommendation.
+        """
         entry = self.get_entry(entry_id)
         if entry is None:
             return (Tier.COLD, 0.0)
@@ -484,22 +513,22 @@ class Rolodex:
         elif score < demotion_threshold:
             return (Tier.COLD, score)
         else:
-
+            # In the middle band — keep current tier (hysteresis)
             return (entry.tier, score)
 
     def promote_entry(self, entry_id: str) -> Optional[TierEvent]:
-
+        """Promote an entry to HOT tier. Updates DB and adds to cache."""
         entry = self.get_entry(entry_id)
         if entry is None or entry.tier == Tier.HOT:
             return None
         old_tier = entry.tier
-
+        # Update DB
         self.conn.execute(
             "UPDATE rolodex_entries SET tier = ? WHERE id = ?",
             ("hot", entry_id)
         )
         self.conn.commit()
-
+        # Update in-memory
         entry.tier = Tier.HOT
         self._cache_put(entry)
         score = compute_importance_score(entry)
@@ -511,7 +540,7 @@ class Rolodex:
         )
 
     def demote_entry(self, entry_id: str) -> Optional[TierEvent]:
-
+        """Demote an entry to COLD tier. Updates DB and removes from cache."""
         entry = self.get_entry(entry_id)
         if entry is None or entry.tier == Tier.COLD:
             return None
@@ -519,13 +548,13 @@ class Rolodex:
         if entry.category == EntryCategory.USER_KNOWLEDGE:
             return None
         old_tier = entry.tier
-
+        # Update DB
         self.conn.execute(
             "UPDATE rolodex_entries SET tier = ? WHERE id = ?",
             ("cold", entry_id)
         )
         self.conn.commit()
-
+        # Remove from cache
         if entry_id in self._hot_cache:
             del self._hot_cache[entry_id]
         score = compute_importance_score(entry)
@@ -543,8 +572,10 @@ class Rolodex:
         recency_half_life: float = 24.0,
         age_boost_half_life: float = 48.0,
     ) -> Dict[str, Any]:
-
-
+        """
+        Scan all entries, evaluate importance scores, promote/demote as needed.
+        Returns a summary of actions taken.
+        """
         events: List[TierEvent] = []
         promoted = 0
         demoted = 0
@@ -576,8 +607,10 @@ class Rolodex:
         }
 
     def preload_hot_entries(self) -> int:
-
-
+        """
+        On startup, load all HOT-tier entries from DB into the cache.
+        Returns the number of entries loaded.
+        """
         rows = self.conn.execute(
             "SELECT * FROM rolodex_entries WHERE tier = 'hot' ORDER BY access_count DESC"
         ).fetchall()
@@ -588,9 +621,9 @@ class Rolodex:
             loaded += 1
         return loaded
 
-
+    # ─── Stats & Management ──────────────────────────────────────────────
     def get_stats(self, conversation_id: Optional[str] = None) -> Dict[str, Any]:
-
+        """Return database statistics."""
         where = ""
         params: list = []
         if conversation_id:
@@ -609,7 +642,7 @@ class Rolodex:
         for row in rows:
             categories[row["category"]] = row["cnt"]
         hot_count = len(self._hot_cache)
-
+        # Tier distribution from DB (persistent tier, not just cache)
         tier_rows = self.conn.execute(
             f"""SELECT tier, COUNT(*) as cnt
                 FROM rolodex_entries {where}
@@ -619,7 +652,7 @@ class Rolodex:
         tier_distribution = {}
         for row in tier_rows:
             tier_distribution[row["tier"]] = row["cnt"]
-
+        # Average importance score for HOT entries
         avg_hot_score = 0.0
         hot_entries = self.conn.execute(
             "SELECT * FROM rolodex_entries WHERE tier = 'hot'"
@@ -640,7 +673,7 @@ class Rolodex:
             "db_path": self.db_path,
         }
     def create_conversation(self, conversation_id: str) -> None:
-
+        """Register a new conversation."""
         self.conn.execute(
             "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
             (conversation_id, datetime.utcnow().isoformat())
@@ -655,7 +688,7 @@ class Rolodex:
         search_time_ms: float,
         search_type: str
     ) -> None:
-
+        """Log a query for Phase 2 analytics."""
         self.conn.execute(
             """INSERT INTO query_log
                (id, conversation_id, query_text, found, entry_ids,
@@ -668,10 +701,10 @@ class Rolodex:
             )
         )
         self.conn.commit()
-
+    # ─── Chain Operations (Phase 7) ──────────────────────────────────────
 
     def create_chain(self, chain: ReasoningChain) -> str:
-
+        """Store a new reasoning chain. Returns the chain ID."""
         values = _serialize_chain(chain)
         self.conn.execute(
             """INSERT INTO chains
@@ -688,7 +721,7 @@ class Rolodex:
         return chain.id
 
     def get_chain(self, chain_id: str) -> Optional[ReasoningChain]:
-
+        """Fetch a chain by ID."""
         row = self.conn.execute(
             "SELECT * FROM chains WHERE id = ?", (chain_id,)
         ).fetchone()
@@ -697,7 +730,7 @@ class Rolodex:
         return None
 
     def get_chains_for_session(self, session_id: str) -> List[ReasoningChain]:
-
+        """Get all chains for a session, ordered by chain_index."""
         rows = self.conn.execute(
             "SELECT * FROM chains WHERE session_id = ? ORDER BY chain_index ASC",
             (session_id,)
@@ -707,7 +740,7 @@ class Rolodex:
     def get_chain_by_index(
         self, session_id: str, chain_index: int
     ) -> Optional[ReasoningChain]:
-
+        """Get a specific chain by session + index (for linked-list traversal)."""
         row = self.conn.execute(
             "SELECT * FROM chains WHERE session_id = ? AND chain_index = ?",
             (session_id, chain_index)
@@ -719,11 +752,11 @@ class Rolodex:
     def keyword_search_chains(
         self, query: str, limit: int = 5, session_id: Optional[str] = None
     ) -> List[Tuple[ReasoningChain, float]]:
-
-
+        """Full-text search on chain summaries and topics.
+        Falls back to OR query when AND returns nothing."""
         results = self._fts_match_chains(query, limit, session_id)
 
-
+        # OR fallback for multi-word queries
         if not results and ' ' in query.strip():
             fts_operators = {'AND', 'OR', 'NOT', 'NEAR'}
             terms = [
@@ -739,7 +772,7 @@ class Rolodex:
     def _fts_match_chains(
         self, fts_query: str, limit: int, session_id: Optional[str] = None
     ) -> List[Tuple[ReasoningChain, float]]:
-
+        """Execute a single FTS5 MATCH query on chains."""
         sql = """
             SELECT c.*, cfts.rank
             FROM chains_fts cfts
@@ -768,7 +801,7 @@ class Rolodex:
         min_similarity: float = 0.3,
         session_id: Optional[str] = None
     ) -> List[Tuple[ReasoningChain, float]]:
-
+        """Vector similarity search on chain embeddings."""
         sql = "SELECT * FROM chains WHERE embedding IS NOT NULL"
         params: list = []
         if session_id:
@@ -796,7 +829,7 @@ class Rolodex:
         semantic_weight: float = 0.6,
         session_id: Optional[str] = None
     ) -> List[Tuple[ReasoningChain, float]]:
-
+        """Combined keyword + semantic search on chains."""
         keyword_results = []
         semantic_results = []
 
@@ -818,7 +851,7 @@ class Rolodex:
         )
 
     def get_entries_by_ids(self, entry_ids: List[str]) -> List[RolodexEntry]:
-
+        """Fetch multiple entries by ID list. Returns found entries."""
         if not entry_ids:
             return []
         placeholders = ",".join("?" for _ in entry_ids)
@@ -828,21 +861,22 @@ class Rolodex:
         ).fetchall()
         return [deserialize_entry(row) for row in rows]
 
+    # ─── Topic CRUD (Phase 8) ────────────────────────────────────────────
 
     def get_entries_by_topic(
         self, topic_id: str, limit: int = 50
     ) -> List[RolodexEntry]:
-
+        """Fetch entries assigned to a specific topic."""
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE topic_id = ? AND superseded_by IS NULL
+               WHERE topic_id = ?
                ORDER BY created_at DESC LIMIT ?""",
             (topic_id, limit)
         ).fetchall()
         return [deserialize_entry(row) for row in rows]
 
     def list_topics(self, limit: int = 50) -> List[dict]:
-
+        """List all topics with metadata."""
         rows = self.conn.execute(
             "SELECT * FROM topics ORDER BY entry_count DESC LIMIT ?",
             (limit,)
@@ -859,7 +893,7 @@ class Rolodex:
         ]
 
     def get_topic(self, topic_id: str) -> Optional[dict]:
-
+        """Fetch a single topic by ID."""
         row = self.conn.execute(
             "SELECT * FROM topics WHERE id = ?", (topic_id,)
         ).fetchone()
@@ -873,7 +907,7 @@ class Rolodex:
             "created_at": row["created_at"],
         }
 
-    # ── User Knowledge ─────────────────────────────────────────────
+    # ─── User Knowledge ─────────────────────────────────────────────
 
     def get_user_knowledge_entries(self) -> List[RolodexEntry]:
         """Fetch all user_knowledge entries, always active, never filtered.
@@ -894,9 +928,7 @@ class Rolodex:
             self._cache_put(entry)
         return entries
 
-    # ── User Profile ──────────────────────────────────────────────
-
-    # ── Entry Superseding (Corrections) ────────────────────────────
+    # ─── Entry Superseding (Corrections) ────────────────────────────
 
     def supersede_entry(self, old_entry_id: str, new_entry_id: str) -> bool:
         """Mark an old entry as superseded by a new one.
@@ -928,6 +960,8 @@ class Rolodex:
             del self._hot_cache[old_entry_id]
 
         return True
+
+    # ─── User Profile ──────────────────────────────────────────────
 
     def profile_set(self, key: str, value: str, session_id: Optional[str] = None) -> None:
         """Set or update a user profile preference (upsert)."""
@@ -966,12 +1000,12 @@ class Rolodex:
         return cursor.rowcount > 0
 
     def close(self):
-
+        """Close the database connection."""
         if self.conn:
             self.conn.close()
-
+# ─── Helper Functions ─────────────────────────────────────────────────────────
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
-
+    """Compute cosine similarity between two vectors. Pure Python, no numpy needed."""
     if len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -980,8 +1014,6 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
-USER_KNOWLEDGE_BOOST = 3.0  # user_knowledge entries score 3x higher
-
 def _merge_search_results(
     keyword_results: List[Tuple[RolodexEntry, float]],
     semantic_results: List[Tuple[RolodexEntry, float]],
@@ -989,33 +1021,36 @@ def _merge_search_results(
     semantic_weight: float,
     limit: int
 ) -> List[Tuple[RolodexEntry, float]]:
-
+    """Merge and deduplicate keyword + semantic results by weighted score."""
     scores: Dict[str, float] = {}
     entries: Dict[str, RolodexEntry] = {}
-
+    # Normalize keyword scores to 0-1
     if keyword_results:
         max_kw = max(s for _, s in keyword_results) or 1.0
         for entry, score in keyword_results:
             norm_score = (score / max_kw) * keyword_weight
             scores[entry.id] = scores.get(entry.id, 0) + norm_score
             entries[entry.id] = entry
-
+    # Semantic scores are already 0-1 (cosine similarity)
     for entry, score in semantic_results:
         norm_score = score * semantic_weight
         scores[entry.id] = scores.get(entry.id, 0) + norm_score
         entries[entry.id] = entry
-
     # Boost user_knowledge entries so they always surface above bulk content
     for eid, entry in entries.items():
         if entry.category.value == "user_knowledge":
             scores[eid] *= USER_KNOWLEDGE_BOOST
 
+    # Sort by combined score
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [(entries[eid], score) for eid, score in ranked[:limit]]
 
+USER_KNOWLEDGE_BOOST = 3.0  # user_knowledge entries score 3x higher
+
+# ─── Chain Serialization (Phase 7) ───────────────────────────────────────────
 
 def _serialize_chain(chain: ReasoningChain) -> tuple:
-
+    """Convert ReasoningChain to tuple for SQL INSERT."""
     return (
         chain.id,
         chain.session_id,
@@ -1031,7 +1066,7 @@ def _serialize_chain(chain: ReasoningChain) -> tuple:
 
 
 def _deserialize_chain(row: sqlite3.Row) -> ReasoningChain:
-
+    """Convert database row back to ReasoningChain."""
     return ReasoningChain(
         id=row["id"],
         session_id=row["session_id"],
@@ -1056,7 +1091,7 @@ def _merge_chain_search_results(
     semantic_weight: float,
     limit: int
 ) -> List[Tuple[ReasoningChain, float]]:
-
+    """Merge and deduplicate keyword + semantic chain results."""
     scores: Dict[str, float] = {}
     chains: Dict[str, ReasoningChain] = {}
 
