@@ -25,7 +25,8 @@ python "${CLAUDE_PLUGIN_ROOT}/librarian/librarian_cli.py" boot
 ```
 
 Parse the JSON response:
-- `context_block`: Past context about this user. **Don't announce it or parrot it back** — just know it. Let it inform how you greet them and approach their requests.
+- `user_profile`: Structured key-value dict of user preferences (name, timezone, response style, etc.). Always present if profile has been set. **Use this to personalize your interactions** — don't announce it, just apply it.
+- `context_block`: Past context about this user, with the user profile block at the top (if set). **Don't announce it or parrot it back** — just know it. Let it inform how you greet them and approach their requests.
 - `context_window.bridge_summary`: If non-null, this summarizes conversation history that was pruned from your active context. Treat it as orientation — you had this conversation, the details are in the rolodex, and you can recall specifics on demand.
 - `context_window.active_messages` / `budget_remaining`: Your current window utilization. No action needed — just awareness.
 - `total_entries: 0` means this is a fresh start. No past context yet. Suggest the user run `/librarian-start` to scan a folder.
@@ -90,6 +91,29 @@ This returns a formatted context block with relevant past entries. Fold the resu
 If nothing relevant is found, the output will say "No relevant memories found." — just proceed normally.
 
 **Recall is your long-term memory.** With the context window manager keeping your active context lean, recall becomes more important — it's how you access anything older than the recent working set. Use it liberally.
+
+## User Profile
+
+The Librarian has a dedicated **user profile** — a structured key-value store for persistent user preferences. Unlike regular rolodex entries, profile values are deduplicated (setting a key replaces the old value) and always loaded on boot.
+
+**Set a preference:**
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/librarian/librarian_cli.py" profile set <key> <value>
+```
+
+**View all preferences:**
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/librarian/librarian_cli.py" profile show
+```
+
+**Remove a preference:**
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/librarian/librarian_cli.py" profile delete <key>
+```
+
+Common profile keys: `name`, `timezone`, `response_style`, `preferred_language`, `editor`, `os`. Keys are normalized to lowercase with underscores.
+
+When the user states a preference ("I prefer concise responses", "my timezone is Eastern"), use `profile set` to capture it durably — don't just ingest it as a regular entry.
 
 ## Context Window Awareness
 

@@ -30,6 +30,7 @@ class EntryCategory(Enum):
     FACT = "fact"
     WARNING = "warning"
     NOTE = "note"
+    USER_KNOWLEDGE = "user_knowledge"
 class Tier(Enum):
     HOT = "hot"
     COLD = "cold"

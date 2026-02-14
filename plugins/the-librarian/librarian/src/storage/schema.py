@@ -160,6 +160,14 @@ CREATE INDEX IF NOT EXISTS idx_topic_assignments_entry
     ON topic_assignments(entry_id);
 CREATE INDEX IF NOT EXISTS idx_topic_assignments_topic
     ON topic_assignments(topic_id);
+
+-- User profile: structured key-value store for user preferences
+CREATE TABLE IF NOT EXISTS user_profile (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    source_session TEXT,
+    updated_at DATETIME NOT NULL
+);
 """
 
 def init_database(db_path: str) -> sqlite3.Connection:
@@ -187,6 +195,7 @@ def _safe_add_columns(conn: sqlite3.Connection):
         ("conversations", "message_count", "INTEGER DEFAULT 0"),
 
         ("rolodex_entries", "topic_id", "TEXT"),
+        ("rolodex_entries", "superseded_by", "TEXT"),
     ]
     for table, column, col_type in additions:
         try:

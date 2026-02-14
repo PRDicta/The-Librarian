@@ -108,6 +108,18 @@ async def cmd_boot():
     past_sessions = lib.list_sessions(limit=10)
 
 
+    # Load user profile (always, regardless of entry count)
+    from src.retrieval.context_builder import ContextBuilder
+    cb = ContextBuilder()
+    profile = lib.rolodex.profile_get_all()
+    profile_block = ""
+    if profile:
+        profile_block = cb.build_profile_block(profile)
+
+    # Load user_knowledge entries (always, these are privileged)
+    uk_entries = lib.rolodex.get_user_knowledge_entries()
+    uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
+
     context_block = ""
     if stats.get("total_entries", 0) > 0:
 
@@ -117,9 +129,17 @@ async def cmd_boot():
                 context_block = lib.get_context_block(response)
                 break
 
+    # Build final context: profile first, then user knowledge, then retrieved
+    preamble_parts = [p for p in [profile_block, uk_block] if p]
+    if preamble_parts:
+        preamble = "\n\n".join(preamble_parts)
+        context_block = preamble + ("\n\n" + context_block if context_block else "")
 
     window_state = lib.context_window.get_state(lib.state.messages)
     bridge = lib.context_window.bridge_summary
+
+    # Serialize profile for structured access
+    user_profile_json = {k: v["value"] for k, v in profile.items()} if profile else {}
 
     output = {
         "status": "ok",
@@ -127,7 +147,9 @@ async def cmd_boot():
         "session_id": lib.session_id,
         "resumed": resumed,
         "total_entries": stats.get("total_entries", 0),
+        "user_knowledge_entries": len(uk_entries),
         "past_sessions": len(past_sessions),
+        "user_profile": user_profile_json,
         "context_block": context_block,
         "context_window": {
             "active_messages": window_state.active_messages,
@@ -143,7 +165,7 @@ async def cmd_boot():
     print(json.dumps(output, indent=2))
 
 
-async def cmd_ingest(role, content):
+async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False):
 
     lib, _ = _make_librarian()
 
@@ -156,15 +178,35 @@ async def cmd_ingest(role, content):
 
     entries = await lib.ingest(role, content)
 
+    # If this ingestion corrects a previous entry, supersede it
+    superseded = False
+    if corrects_id and entries:
+        new_id = entries[0].id
+        superseded = lib.rolodex.supersede_entry(corrects_id, new_id)
+
+    # If flagged as user knowledge, recategorize and promote
+    if as_user_knowledge and entries:
+        for entry in entries:
+            lib.rolodex.update_entry_enrichment(
+                entry.id,
+                category=_get_entry_category("user_knowledge"),
+            )
+            lib.rolodex.promote_entry(entry.id)
 
     window = lib.context_window.get_stats()
     close_db(lib)
-    print(json.dumps({
+    result = {
         "ingested": len(entries),
         "session_id": lib.session_id,
         "checkpoint": window["last_checkpoint_turn"],
         "total_checkpoints": window["checkpoints"],
-    }))
+    }
+    if corrects_id:
+        result["corrects"] = corrects_id
+        result["superseded"] = superseded
+    if as_user_knowledge:
+        result["user_knowledge"] = True
+    print(json.dumps(result))
 
 
 async def cmd_batch_ingest(json_path):
@@ -510,6 +552,127 @@ async def cmd_scan(directory):
     }))
 
 
+async def cmd_remember(content):
+    """Ingest content as user_knowledge — privileged, always-on context.
+
+    Use for facts about the user that should always be available:
+    name corrections, preferences, biographical details, working style, etc.
+    These entries are always loaded at boot, boosted in search, and never demoted.
+    """
+    lib, _ = _make_librarian()
+
+    session_id = load_session_id()
+    if session_id:
+        lib.resume_session(session_id)
+    else:
+        save_session_id(lib.session_id)
+
+    entries = await lib.ingest("user", content)
+
+    # Recategorize as user_knowledge and promote to hot
+    for entry in entries:
+        lib.rolodex.update_entry_enrichment(
+            entry.id,
+            category=_get_entry_category("user_knowledge"),
+        )
+        lib.rolodex.promote_entry(entry.id)
+
+    close_db(lib)
+    print(json.dumps({
+        "remembered": len(entries),
+        "entry_ids": [e.id for e in entries],
+        "session_id": lib.session_id,
+        "content_preview": content[:120],
+    }))
+
+
+def _get_entry_category(name):
+    """Helper to get EntryCategory by value string."""
+    _lazy_imports()
+    from src.core.types import EntryCategory
+    return EntryCategory(name)
+
+
+async def cmd_correct(old_entry_id, new_content, role="user"):
+    """Supersede an old entry with corrected content in one step.
+
+    Use this for factual error corrections (wrong name, wrong date, etc.).
+    Do NOT use for reasoning chains where the evolution matters.
+    """
+    lib, _ = _make_librarian()
+
+    session_id = load_session_id()
+    if session_id:
+        lib.resume_session(session_id)
+    else:
+        save_session_id(lib.session_id)
+
+    # Verify old entry exists
+    old_entry = lib.rolodex.get_entry(old_entry_id)
+    if not old_entry:
+        close_db(lib)
+        print(json.dumps({"error": f"Entry not found: {old_entry_id}"}))
+        sys.exit(1)
+
+    # Ingest the corrected content
+    entries = await lib.ingest(role, new_content)
+    if not entries:
+        close_db(lib)
+        print(json.dumps({"error": "Ingestion produced no entries"}))
+        sys.exit(1)
+
+    new_id = entries[0].id
+    lib.rolodex.supersede_entry(old_entry_id, new_id)
+
+    close_db(lib)
+    print(json.dumps({
+        "corrected": True,
+        "old_entry_id": old_entry_id,
+        "new_entry_id": new_id,
+        "old_content_preview": old_entry.content[:120],
+        "new_content_preview": new_content[:120],
+    }))
+
+
+async def cmd_profile(subcmd, args):
+
+    lib, _ = _make_librarian()
+
+    session_id = load_session_id()
+    if session_id:
+        lib.resume_session(session_id)
+
+    if subcmd == "set":
+        if len(args) < 2:
+            print(json.dumps({"error": "Usage: profile set <key> <value>"}))
+            sys.exit(1)
+        key = args[0].lower().replace(" ", "_")
+        value = args[1]
+        lib.rolodex.profile_set(key, value, session_id=session_id)
+        print(json.dumps({"ok": True, "key": key, "value": value}))
+
+    elif subcmd == "show":
+        profile = lib.rolodex.profile_get_all()
+        if not profile:
+            print(json.dumps({"profile": {}, "message": "No profile entries yet. Use 'profile set <key> <value>' to add."}))
+        else:
+            print(json.dumps({"profile": {k: v["value"] for k, v in profile.items()}}, indent=2))
+
+    elif subcmd == "delete":
+        if not args:
+            print(json.dumps({"error": "Usage: profile delete <key>"}))
+            sys.exit(1)
+        key = args[0].lower().replace(" ", "_")
+        existed = lib.rolodex.profile_delete(key)
+        print(json.dumps({"ok": True, "key": key, "deleted": existed}))
+
+    else:
+        print(json.dumps({"error": f"Unknown profile subcommand: {subcmd}. Use set|show|delete"}))
+        sys.exit(1)
+
+    close_db(lib)
+
+
 async def cmd_window():
 
     lib, _ = _make_librarian()
@@ -535,7 +698,7 @@ async def cmd_window():
 
 async def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|stats|end|topics|window> [args]"}))
+        print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|profile|stats|end|topics|window> [args]"}))
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
@@ -545,15 +708,30 @@ async def main():
             await cmd_boot()
 
         elif cmd == "ingest":
-            if len(sys.argv) < 4:
-                print(json.dumps({"error": "Usage: librarian_cli.py ingest <user|assistant> \"<text>\""}))
+            # Parse optional flags
+            corrects_id = None
+            as_user_knowledge = False
+            argv_rest = sys.argv[2:]
+            if "--corrects" in argv_rest:
+                idx = argv_rest.index("--corrects")
+                if idx + 1 < len(argv_rest):
+                    corrects_id = argv_rest[idx + 1]
+                    argv_rest = argv_rest[:idx] + argv_rest[idx + 2:]
+                else:
+                    print(json.dumps({"error": "--corrects requires an entry ID"}))
+                    sys.exit(1)
+            if "--user-knowledge" in argv_rest:
+                argv_rest.remove("--user-knowledge")
+                as_user_knowledge = True
+            if len(argv_rest) < 2:
+                print(json.dumps({"error": "Usage: librarian_cli.py ingest <user|assistant> \"<text>\" [--corrects <id>] [--user-knowledge]"}))
                 sys.exit(1)
-            role = sys.argv[2].lower()
-            content = sys.argv[3]
+            role = argv_rest[0].lower()
+            content = argv_rest[1]
             if role not in ("user", "assistant"):
                 print(json.dumps({"error": "Role must be 'user' or 'assistant'"}))
                 sys.exit(1)
-            await cmd_ingest(role, content)
+            await cmd_ingest(role, content, corrects_id=corrects_id, as_user_knowledge=as_user_knowledge)
 
         elif cmd == "batch-ingest":
             if len(sys.argv) < 3:
@@ -582,14 +760,33 @@ async def main():
         elif cmd == "window":
             await cmd_window()
 
+        elif cmd == "profile":
+            subcmd = sys.argv[2].lower() if len(sys.argv) > 2 else "show"
+            args = sys.argv[3:] if len(sys.argv) > 3 else []
+            await cmd_profile(subcmd, args)
+
         elif cmd == "scan":
             if len(sys.argv) < 3:
                 print(json.dumps({"error": "Usage: librarian_cli.py scan <directory>"}))
                 sys.exit(1)
             await cmd_scan(sys.argv[2])
 
+        elif cmd == "correct":
+            if len(sys.argv) < 4:
+                print(json.dumps({"error": "Usage: librarian_cli.py correct <old_entry_id> \"<corrected text>\""}))
+                sys.exit(1)
+            old_id = sys.argv[2]
+            new_content = sys.argv[3]
+            await cmd_correct(old_id, new_content)
+
+        elif cmd == "remember":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py remember \"<fact about the user>\""}))
+                sys.exit(1)
+            await cmd_remember(sys.argv[2])
+
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|scan|stats|end|topics|window"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|stats|end|topics|window"}))
             sys.exit(1)
 
     except Exception as e:

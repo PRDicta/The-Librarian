@@ -1,7 +1,7 @@
 
 
 
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from ..core.types import RolodexEntry
 class ContextBuilder:
 
@@ -12,6 +12,12 @@ class ContextBuilder:
 
     CHAIN_HEADER = "═══ REASONING CONTEXT ═══"
     CHAIN_FOOTER = "═══ END REASONING CONTEXT ═══"
+
+    PROFILE_HEADER = "═══ USER PROFILE ═══"
+    PROFILE_FOOTER = "═══ END USER PROFILE ═══"
+
+    USER_KNOWLEDGE_HEADER = "═══ USER KNOWLEDGE ═══"
+    USER_KNOWLEDGE_FOOTER = "═══ END USER KNOWLEDGE ═══"
 
     def build_context_block(
         self,
@@ -103,6 +109,36 @@ class ContextBuilder:
             lines.append(self._format_entry(entry, i + 1))
             lines.append("")
         lines.append(self.PROACTIVE_FOOTER)
+        return "\n".join(lines)
+
+    def build_profile_block(self, profile: Dict[str, Any]) -> str:
+        """Format the user profile as a readable block for context injection."""
+        if not profile:
+            return ""
+        lines = [self.PROFILE_HEADER, ""]
+        for key, entry in profile.items():
+            display_key = key.replace("_", " ").title()
+            lines.append(f"{display_key}: {entry['value']}")
+        lines.append("")
+        lines.append(self.PROFILE_FOOTER)
+        return "\n".join(lines)
+
+    def build_user_knowledge_block(self, entries: list) -> str:
+        """Format user_knowledge entries as a persistent context block.
+
+        These are always injected at boot alongside the profile.
+        """
+        if not entries:
+            return ""
+        lines = [self.USER_KNOWLEDGE_HEADER, ""]
+        for entry in entries:
+            tags_str = ", ".join(entry.tags) if entry.tags else ""
+            if tags_str:
+                lines.append(f"[{tags_str}]")
+            lines.append(entry.content)
+            lines.append(self.SEPARATOR)
+            lines.append("")
+        lines.append(self.USER_KNOWLEDGE_FOOTER)
         return "\n".join(lines)
 
     def build_not_found_message(self, query_text: str) -> str:

@@ -1,68 +1,59 @@
 # The Librarian
 
-**Stop re-explaining your project every session.**
+**Persistent memory for Claude.** The Librarian indexes your files and conversations into a local SQLite database, giving Claude perfect recall across sessions.
 
-The Librarian gives Claude persistent memory — file indexing, conversation recall, and context management that survives across sessions. Everything is stored locally in a SQLite rolodex on your machine.
+## What it does
 
-## Quick start
+- **Folder scanning**: Point The Librarian at any folder and it reads, chunks, and indexes every text file — code, docs, configs, markdown, everything.
+- **Conversation memory**: Every substantive exchange is automatically stored. Preferences, decisions, project facts, code patterns — nothing gets lost.
+- **Smart retrieval**: Hybrid search (keyword + semantic) finds relevant context when you need it, even across sessions.
+- **Context window management**: Keeps Claude's active context lean by safely offloading older content to the rolodex, retrievable on demand.
+
+## Prerequisites
+
+The Librarian runs inside the Claude environment (Cowork or Claude Code), which includes Python out of the box. All Python dependencies are installed automatically when you run `/librarian-start` — no manual setup required.
+
+## Getting started
+
+After installing the plugin, run:
 
 ```
 /librarian-start
 ```
 
-That’s it. Dependencies install automatically, the memory system boots, and you’re walked through scanning your first folder. No API keys required. No manual setup.
-
-## What happens next
-
-Once The Librarian is running, it works in the background:
-
-- **Your files are indexed.** Code, docs, configs, markdown — chunked intelligently by content type and stored verbatim in the rolodex.
-- **Your conversations are remembered.** Preferences, decisions, project facts, code patterns — captured automatically, available next session.
-- **Context stays lean.** The Librarian offloads older content from Claude’s active window and retrieves it on demand, so sessions run longer without compacting.
-
-Need something from a previous session? Just ask, or use `/recall`:
-
-```
-/recall authentication flow we discussed last week
-```
+This installs dependencies, boots the memory system, and walks you through scanning your first folder.
 
 ## Commands
 
-| Command | What it does |
+| Command | Description |
 |---------|-------------|
 | `/librarian-start` | First-time setup and folder scanning |
-| `/recall <query>` | Search your memory |
-| `/librarian-stats` | See what The Librarian knows |
+| `/recall <query>` | Search your memory for past context |
+| `/librarian-stats` | See what The Librarian knows about you |
 
-## Architecture
+## How it works
 
-Three-tier memory with automatic promotion:
+The Librarian uses a three-tier architecture:
 
-1. **Active Context** — Claude’s current window, kept slim
-2. **Hot Cache** — frequently accessed entries, instant retrieval
-3. **Cold Storage** — local SQLite with FTS5 full-text search
+1. **Active Context** — Claude's current context window (slim, focused)
+2. **Hot Cache** — Frequently accessed entries kept in memory for fast retrieval
+3. **Cold Storage** — Everything else in a local SQLite database with FTS5 full-text search
 
-Hybrid search combines keyword matching with semantic similarity (local embeddings via `all-MiniLM-L6-v2`). No cloud vector databases. No external services.
+Content is chunked intelligently based on its type (prose, code, structured data, math) and stored verbatim — no compression, no summarization. Frequency of access determines importance, and entries are promoted or demoted between tiers automatically.
 
-## Two modes
+## Data & Backup
 
-| | Verbatim (default) | Enhanced |
-|---|---|---|
-| Setup | None — works at install | Add an Anthropic API key |
-| Extraction | Heuristic, rule-based | LLM-powered with topic routing |
-| Embeddings | Local (`all-MiniLM-L6-v2`) | Local (`all-MiniLM-L6-v2`) |
-| Storage | Local SQLite | Local SQLite |
-| Cost | Free | API usage charges apply |
+Your memory lives in a single file: `librarian/rolodex.db`. This is a standard SQLite database — portable, self-contained, no server required.
 
-Enhanced mode is an optional upgrade. The Librarian is fully functional without it.
+While the database is in use, SQLite creates two companion files: `rolodex.db-wal` (write-ahead log for crash safety) and `rolodex.db-shm` (shared memory index). These are transient — they get folded back into the main `.db` file when the connection closes cleanly.
+
+**To back up your memory:** Copy all three files (`rolodex.db`, `rolodex.db-wal`, `rolodex.db-shm`) if The Librarian is running. If it's not running, only `rolodex.db` is needed — the WAL and SHM files won't exist.
+
+**To migrate to another machine:** Copy `rolodex.db` to the same relative path (`librarian/rolodex.db`) in the new workspace. Boot The Librarian and your full history carries over.
 
 ## Privacy
 
-Everything stays on your machine. The rolodex is a local SQLite file. No data leaves your computer beyond the normal Claude conversation. No telemetry, no cloud sync, no external dependencies.
-
-## Prerequisites
-
-The Librarian runs inside the Claude environment (Cowork or Claude Code), which includes Python out of the box. All Python dependencies are installed automatically when you run `/librarian-start`.
+Everything stays on your machine. The rolodex is a local SQLite file. No data is sent to external services beyond the normal Claude conversation. The only API calls are to Anthropic's models (which you're already using).
 
 ## License
 

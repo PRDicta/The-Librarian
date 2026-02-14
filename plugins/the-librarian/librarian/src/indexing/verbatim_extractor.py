@@ -2,9 +2,39 @@
 
 
 import re
+from datetime import datetime
 from typing import Dict, List
 
 from ..core.types import ContentModality
+
+
+_TIME_BUCKETS = {
+    range(5, 12): "morning",
+    range(12, 17): "afternoon",
+    range(17, 21): "evening",
+}
+
+
+def _temporal_tags(dt: datetime = None) -> List[str]:
+    """Generate date and time tags from a datetime."""
+    dt = dt or datetime.now()
+    tags = [
+        dt.strftime("%Y-%m-%d"),           # "2026-02-13"
+        dt.strftime("%A").lower(),          # "thursday"
+        dt.strftime("%B").lower(),          # "february"
+        str(dt.year),                       # "2026"
+    ]
+    # Time-of-day bucket
+    hour = dt.hour
+    for r, label in _TIME_BUCKETS.items():
+        if hour in r:
+            tags.append(label)
+            break
+    else:
+        tags.append("night")               # 9pm–4am
+    # Clock hour for precision
+    tags.append(dt.strftime("%-I%p").lower())  # "9pm", "10am"
+    return tags
 
 
 MODALITY_CATEGORY_MAP = {
@@ -131,7 +161,10 @@ class VerbatimExtractor:
             if 3 <= len(term) <= 40:
                 tags.add(term.lower())
 
-        return sorted(tags)[:10]
+        # Temporal tags — always included, don't count toward the cap
+        temporal = _temporal_tags()
+        semantic_tags = sorted(tags)[:10]
+        return temporal + semantic_tags
 
     def _extract_code_identifiers(self, text: str) -> List[str]:
 

@@ -208,6 +208,7 @@ class Rolodex:
             FROM rolodex_fts fts
             JOIN rolodex_entries re ON re.id = fts.entry_id
             WHERE rolodex_fts MATCH ?
+            AND re.superseded_by IS NULL
         """
         params: list = [fts_query]
         if conversation_id:
@@ -233,7 +234,7 @@ class Rolodex:
     ) -> List[Tuple[RolodexEntry, float]]:
 
 
-        sql = "SELECT * FROM rolodex_entries WHERE embedding IS NOT NULL"
+        sql = "SELECT * FROM rolodex_entries WHERE embedding IS NOT NULL AND superseded_by IS NULL"
         params: list = []
         if conversation_id:
             sql += " AND conversation_id = ?"
@@ -334,6 +335,7 @@ class Rolodex:
             JOIN rolodex_entries re ON re.id = fts.entry_id
             WHERE rolodex_fts MATCH ?
             AND re.topic_id = ?
+            AND re.superseded_by IS NULL
             ORDER BY fts.rank LIMIT ?
         """
         rows = self.conn.execute(sql, (query, topic_id, limit)).fetchall()
@@ -370,7 +372,8 @@ class Rolodex:
 
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE embedding IS NOT NULL AND topic_id = ?""",
+               WHERE embedding IS NOT NULL AND topic_id = ?
+               AND superseded_by IS NULL""",
             (topic_id,)
         ).fetchall()
         scored = []
@@ -416,7 +419,7 @@ class Rolodex:
         self, category: str, conversation_id: Optional[str] = None, limit: int = 20
     ) -> List[RolodexEntry]:
 
-        sql = "SELECT * FROM rolodex_entries WHERE category = ?"
+        sql = "SELECT * FROM rolodex_entries WHERE category = ? AND superseded_by IS NULL"
         params: list = [category]
         if conversation_id:
             sql += " AND conversation_id = ?"
@@ -431,7 +434,7 @@ class Rolodex:
 
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE conversation_id = ?
+               WHERE conversation_id = ? AND superseded_by IS NULL
                ORDER BY created_at DESC LIMIT ?""",
             (conversation_id, limit)
         ).fetchall()
@@ -511,6 +514,9 @@ class Rolodex:
 
         entry = self.get_entry(entry_id)
         if entry is None or entry.tier == Tier.COLD:
+            return None
+        # Never demote user_knowledge entries
+        if entry.category == EntryCategory.USER_KNOWLEDGE:
             return None
         old_tier = entry.tier
 
@@ -829,7 +835,7 @@ class Rolodex:
 
         rows = self.conn.execute(
             """SELECT * FROM rolodex_entries
-               WHERE topic_id = ?
+               WHERE topic_id = ? AND superseded_by IS NULL
                ORDER BY created_at DESC LIMIT ?""",
             (topic_id, limit)
         ).fetchall()
@@ -867,6 +873,98 @@ class Rolodex:
             "created_at": row["created_at"],
         }
 
+    # ── User Knowledge ─────────────────────────────────────────────
+
+    def get_user_knowledge_entries(self) -> List[RolodexEntry]:
+        """Fetch all user_knowledge entries, always active, never filtered.
+
+        These represent persistent facts about the user that should
+        always be loaded at boot and boosted in search results.
+        """
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE category = 'user_knowledge'
+               AND superseded_by IS NULL
+               ORDER BY created_at ASC"""
+        ).fetchall()
+        entries = [deserialize_entry(row) for row in rows]
+        # Always keep in hot cache
+        for entry in entries:
+            entry.tier = Tier.HOT
+            self._cache_put(entry)
+        return entries
+
+    # ── User Profile ──────────────────────────────────────────────
+
+    # ── Entry Superseding (Corrections) ────────────────────────────
+
+    def supersede_entry(self, old_entry_id: str, new_entry_id: str) -> bool:
+        """Mark an old entry as superseded by a new one.
+
+        The old entry stays in the DB but is excluded from all searches.
+        Use this for factual error corrections — not for reasoning chains
+        where the evolution of thought should be preserved.
+
+        Returns True if the old entry existed and was updated.
+        """
+        row = self.conn.execute(
+            "SELECT id FROM rolodex_entries WHERE id = ?", (old_entry_id,)
+        ).fetchone()
+        if not row:
+            return False
+
+        self.conn.execute(
+            "UPDATE rolodex_entries SET superseded_by = ? WHERE id = ?",
+            (new_entry_id, old_entry_id)
+        )
+        # Remove from FTS so it never surfaces in keyword search
+        self.conn.execute(
+            "DELETE FROM rolodex_fts WHERE entry_id = ?", (old_entry_id,)
+        )
+        self.conn.commit()
+
+        # Evict from hot cache
+        if old_entry_id in self._hot_cache:
+            del self._hot_cache[old_entry_id]
+
+        return True
+
+    def profile_set(self, key: str, value: str, session_id: Optional[str] = None) -> None:
+        """Set or update a user profile preference (upsert)."""
+        now = datetime.utcnow().isoformat()
+        self.conn.execute(
+            """INSERT INTO user_profile (key, value, source_session, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   source_session = excluded.source_session,
+                   updated_at = excluded.updated_at""",
+            (key, value, session_id, now)
+        )
+        self.conn.commit()
+
+    def profile_get_all(self) -> Dict[str, Any]:
+        """Return all profile entries as {key: {value, source_session, updated_at}}."""
+        rows = self.conn.execute(
+            "SELECT key, value, source_session, updated_at FROM user_profile ORDER BY key"
+        ).fetchall()
+        return {
+            row["key"]: {
+                "value": row["value"],
+                "source_session": row["source_session"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        }
+
+    def profile_delete(self, key: str) -> bool:
+        """Delete a profile key. Returns True if it existed."""
+        cursor = self.conn.execute(
+            "DELETE FROM user_profile WHERE key = ?", (key,)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def close(self):
 
         if self.conn:
@@ -882,6 +980,8 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+USER_KNOWLEDGE_BOOST = 3.0  # user_knowledge entries score 3x higher
+
 def _merge_search_results(
     keyword_results: List[Tuple[RolodexEntry, float]],
     semantic_results: List[Tuple[RolodexEntry, float]],
@@ -904,6 +1004,11 @@ def _merge_search_results(
         norm_score = score * semantic_weight
         scores[entry.id] = scores.get(entry.id, 0) + norm_score
         entries[entry.id] = entry
+
+    # Boost user_knowledge entries so they always surface above bulk content
+    for eid, entry in entries.items():
+        if entry.category.value == "user_knowledge":
+            scores[eid] *= USER_KNOWLEDGE_BOOST
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [(entries[eid], score) for eid, score in ranked[:limit]]
