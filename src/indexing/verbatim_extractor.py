@@ -47,8 +47,10 @@ def _temporal_tags(dt: datetime = None) -> List[str]:
             break
     else:
         tags.append("night")               # 9pm–4am
-    # Clock hour for precision
-    tags.append(dt.strftime("%-I%p").lower())  # "9pm", "10am"
+    # Clock hour for precision (cross-platform: %-I is POSIX-only, %#I is Windows-only)
+    hour12 = dt.hour % 12 or 12
+    am_pm = "am" if dt.hour < 12 else "pm"
+    tags.append(f"{hour12}{am_pm}")  # "9pm", "10am"
     return tags
 
 
