@@ -1,3 +1,4 @@
+# Build artifacts
 __pycache__/
 *.pyc
 *.pyo
@@ -5,11 +6,20 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.build_venv/
+
+# Runtime state
 .env
 .cowork_session
+.deps_ok
 rolodex.db
 rolodex.db-wal
 rolodex.db-shm
+
+# ONNX model (bundled at build time, too large for git)
+lib/models/
+
+# OS junk
 .fuse_hidden*
 .DS_Store
 Thumbs.db

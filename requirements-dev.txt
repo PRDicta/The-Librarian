@@ -1,0 +1,4 @@
+# The Librarian — Dev/Test Dependencies
+-r requirements.txt
+pytest>=7.0
+pytest-asyncio>=0.21
