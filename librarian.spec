@@ -9,13 +9,17 @@ all-MiniLM-L6-v2 embedding model for offline operation.
 Build command:
     pyinstaller librarian.spec
 
-Output:
-    dist/librarian/          — frozen application folder
-    dist/librarian/librarian.exe  — entry point
+Output (Windows):
+    dist/librarian/              — frozen application folder
+    dist/librarian/librarian.exe — entry point
+
+Output (macOS):
+    dist/The Librarian.app/      — macOS application bundle
 """
 
 import os
 import sys
+import platform as plat
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -23,6 +27,11 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 # ─── Paths ────────────────────────────────────────────────────────────
 SPEC_DIR = os.path.abspath(SPECPATH)
 MODEL_DIR = os.path.join(SPEC_DIR, "lib", "models", "all-MiniLM-L6-v2")
+
+# ─── Platform Detection ──────────────────────────────────────────────
+BUILD_PLATFORM = plat.system()  # "Windows", "Darwin", "Linux"
+IS_MACOS = BUILD_PLATFORM == "Darwin"
+IS_WINDOWS = BUILD_PLATFORM == "Windows"
 
 # ─── Build Mode ──────────────────────────────────────────────────────
 # LEAN mode: small installer-only .exe (~30 MB). No PyTorch, no model.
@@ -227,6 +236,13 @@ if not IS_LEAN:
 # ─── Build ────────────────────────────────────────────────────────────
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
+# UPX must be DISABLED on macOS — it breaks code signatures and notarization.
+upx_enabled = not IS_MACOS
+
+# Entitlements file for macOS hardened runtime
+entitlements_path = os.path.join(SPEC_DIR, "entitlements.plist")
+entitlements = entitlements_path if IS_MACOS and os.path.isfile(entitlements_path) else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -236,13 +252,13 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=upx_enabled,
     console=True,  # CLI tool, not GUI
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=None,
+    entitlements_file=entitlements,
 )
 
 coll = COLLECT(
@@ -250,7 +266,26 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=upx_enabled,
     upx_exclude=[],
     name="librarian",
 )
+
+# ─── macOS App Bundle ────────────────────────────────────────────────
+# On macOS, wrap the COLLECT output into a proper .app bundle.
+# This gives users a double-clickable application with correct
+# Gatekeeper integration and Finder presentation.
+if IS_MACOS:
+    app = BUNDLE(
+        coll,
+        name="The Librarian.app",
+        icon=None,  # TODO: add .icns icon
+        bundle_identifier="com.dictatech.librarian",
+        info_plist={
+            "NSPrincipalClass": "NSApplication",
+            "CFBundleName": "The Librarian",
+            "CFBundleDisplayName": "The Librarian",
+            "CFBundleShortVersionString": "1.0.0",
+            "NSHighResolutionCapable": True,
+        },
+    )

@@ -19,7 +19,20 @@ rolodex.db-shm
 # ONNX model (bundled at build time, too large for git)
 lib/models/
 
+# macOS build artifacts
+*.app/
+*.dmg
+
+# Code signing (keep out of repo)
+*.p12
+*.p8
+*.mobileprovision
+
 # OS junk
 .fuse_hidden*
 .DS_Store
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
+ehthumbs.db

@@ -2650,12 +2650,16 @@ When the user changes their mind on a design decision (e.g. renaming a tool), do
 def cmd_install_gui():
     """Launch a zero-friction GUI installer using tkinter.
 
-    This runs when the user double-clicks librarian.exe with no arguments.
+    This runs when the user double-clicks the app/exe with no arguments.
+    Works on Windows, macOS, and Linux.
     Shows a simple window: title → folder picker → Install → success message.
     No external tools (Inno Setup, NSIS, etc.) required.
     """
     import tkinter as tk
     from tkinter import filedialog, messagebox
+    from src.platform_utils import get_gui_font
+
+    font_family, font_base = get_gui_font()
 
     default_workspace = os.path.join(os.path.expanduser("~"), "Documents", "My Librarian")
 
@@ -2675,20 +2679,20 @@ def cmd_install_gui():
     root.configure(bg=bg)
 
     # ── Title ──
-    tk.Label(root, text="The Librarian", font=("Segoe UI", 20, "bold"),
+    tk.Label(root, text="The Librarian", font=(font_family, font_base + 10, "bold"),
              bg=bg).pack(pady=(25, 2))
     tk.Label(root, text="Persistent Memory for AI Conversations",
-             font=("Segoe UI", 10), fg="#666", bg=bg).pack(pady=(0, 20))
+             font=(font_family, font_base), fg="#666", bg=bg).pack(pady=(0, 20))
 
     # ── Workspace selection ──
-    tk.Label(root, text="Choose your workspace folder:", font=("Segoe UI", 10),
+    tk.Label(root, text="Choose your workspace folder:", font=(font_family, font_base),
              bg=bg, anchor="w").pack(anchor="w", padx=35)
 
     picker_frame = tk.Frame(root, bg=bg)
     picker_frame.pack(fill="x", padx=35, pady=(5, 0))
 
     path_var = tk.StringVar(value=default_workspace)
-    entry = tk.Entry(picker_frame, textvariable=path_var, font=("Segoe UI", 9))
+    entry = tk.Entry(picker_frame, textvariable=path_var, font=(font_family, font_base - 1))
     entry.pack(side="left", fill="x", expand=True)
 
     def browse():
@@ -2700,15 +2704,15 @@ def cmd_install_gui():
             path_var.set(chosen)
 
     tk.Button(picker_frame, text="Browse...", command=browse,
-              font=("Segoe UI", 9)).pack(side="right", padx=(8, 0))
+              font=(font_family, font_base - 1)).pack(side="right", padx=(8, 0))
 
     tk.Label(root, text="This is the folder you'll select in Cowork or Claude Code.\n"
                         "The default works great for most people.",
-             font=("Segoe UI", 8), fg="#888", bg=bg).pack(pady=(4, 15))
+             font=(font_family, font_base - 2), fg="#888", bg=bg).pack(pady=(4, 15))
 
     # ── Status label ──
     status_var = tk.StringVar(value="")
-    status_label = tk.Label(root, textvariable=status_var, font=("Segoe UI", 9),
+    status_label = tk.Label(root, textvariable=status_var, font=(font_family, font_base - 1),
                             fg="#0066cc", bg=bg)
     status_label.pack(pady=(0, 5))
 
@@ -2749,7 +2753,7 @@ def cmd_install_gui():
             messagebox.showerror("Setup Failed", f"Something went wrong:\n{e}")
 
     install_btn = tk.Button(root, text="Install", command=do_install,
-                            font=("Segoe UI", 12, "bold"), width=18,
+                            font=(font_family, font_base + 2, "bold"), width=18,
                             relief="flat", bg="#0066cc", fg="white",
                             activebackground="#004999", activeforeground="white",
                             cursor="hand2")
@@ -2757,36 +2761,35 @@ def cmd_install_gui():
 
     # ── Footer ──
     tk.Label(root, text=f"v{__version__}  \u2022  Dicta Technologies Inc.",
-             font=("Segoe UI", 8), fg="#aaa", bg=bg).pack(side="bottom", pady=8)
+             font=(font_family, font_base - 2), fg="#aaa", bg=bg).pack(side="bottom", pady=8)
 
     root.mainloop()
 
 
 def _self_install_to_path():
-    """Best-effort: copy the frozen exe to AppData and add to user PATH.
+    """Best-effort: copy the frozen app to system location and add to PATH.
 
+    Works on Windows (registry), macOS (shell rc files), and Linux (shell rc files).
     This is a bonus for CLI/Claude Code users. If it fails, the workspace
     is still fully functional for Cowork — so failures are silently ignored.
     """
     if not getattr(sys, 'frozen', False):
         return  # Only relevant for frozen builds
-    if sys.platform != "win32":
-        return
 
     try:
         import shutil
+        from src.platform_utils import (
+            get_system, get_install_base_dir, get_cli_executable_name, add_to_path
+        )
 
+        system = get_system()
         src_exe = sys.executable
         src_dir = os.path.dirname(src_exe)
 
-        # Install to %LOCALAPPDATA%\The Librarian
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if not local_app_data:
-            return
-
-        install_dir = os.path.join(local_app_data, "The Librarian")
-        bin_dir = os.path.join(install_dir, "bin")
-        lib_dir = os.path.join(install_dir, "lib")
+        # Get platform-specific install directories
+        install_base = get_install_base_dir()
+        bin_dir = os.path.join(install_base, "bin")
+        lib_dir = os.path.join(install_base, "lib")
 
         os.makedirs(bin_dir, exist_ok=True)
 
@@ -2796,21 +2799,18 @@ def _self_install_to_path():
                 shutil.rmtree(lib_dir, ignore_errors=True)
             shutil.copytree(src_dir, lib_dir)
 
-        # Copy exe to bin/ for clean PATH entry
-        shutil.copy2(os.path.join(lib_dir, "librarian.exe"),
-                      os.path.join(bin_dir, "librarian.exe"))
+        # Copy CLI executable to bin/ for clean PATH entry
+        exe_name = get_cli_executable_name()
+        src_exe_path = os.path.join(lib_dir, exe_name)
+        dst_exe_path = os.path.join(bin_dir, exe_name)
+        if os.path.isfile(src_exe_path):
+            shutil.copy2(src_exe_path, dst_exe_path)
+            # Make executable on Unix-like systems
+            if system in ("darwin", "linux"):
+                os.chmod(dst_exe_path, 0o755)
 
-        # Add bin/ to user PATH via registry
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
-                            winreg.KEY_ALL_ACCESS) as key:
-            try:
-                current_path, _ = winreg.QueryValueEx(key, "Path")
-            except OSError:
-                current_path = ""
-            if bin_dir.lower() not in current_path.lower():
-                new_path = current_path.rstrip(";") + ";" + bin_dir
-                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
+        # Add bin/ to user PATH using platform-specific method
+        add_to_path(bin_dir)
     except Exception:
         pass  # Best-effort — Cowork doesn't need this
 

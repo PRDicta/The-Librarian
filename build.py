@@ -223,7 +223,10 @@ def run_pyinstaller():
         raise FileNotFoundError(f"Spec file not found: {SPEC_FILE}")
 
     # Clean previous build (use robust_rmtree to handle Windows file locks)
-    for d in [DIST_DIR / "librarian", BUILD_DIR / "build"]:
+    clean_targets = [DIST_DIR / "librarian", BUILD_DIR / "build"]
+    if platform.system() == "Darwin":
+        clean_targets.append(DIST_DIR / "The Librarian.app")
+    for d in clean_targets:
         if d.exists():
             log(f"  Cleaning {d}")
             robust_rmtree(d)
@@ -237,13 +240,25 @@ def run_pyinstaller():
         str(SPEC_FILE),
     ], cwd=str(BUILD_DIR))
 
-    # Verify output exists
-    exe_path = DIST_DIR / "librarian" / ("librarian.exe" if platform.system() == "Windows" else "librarian")
+    # Verify output exists (different paths per platform)
+    if platform.system() == "Darwin":
+        exe_path = DIST_DIR / "The Librarian.app" / "Contents" / "MacOS" / "librarian"
+        dist_root = DIST_DIR / "The Librarian.app"
+        dist_label = "dist/The Librarian.app/"
+    elif platform.system() == "Windows":
+        exe_path = DIST_DIR / "librarian" / "librarian.exe"
+        dist_root = DIST_DIR / "librarian"
+        dist_label = "dist/librarian/"
+    else:
+        exe_path = DIST_DIR / "librarian" / "librarian"
+        dist_root = DIST_DIR / "librarian"
+        dist_label = "dist/librarian/"
+
     if not exe_path.exists():
         raise FileNotFoundError(f"PyInstaller output not found: {exe_path}")
 
-    dist_size = sum(f.stat().st_size for f in (DIST_DIR / "librarian").rglob("*") if f.is_file())
-    log(f"  PyInstaller complete: {dist_size / 1024 / 1024:.0f} MB in dist/librarian/")
+    dist_size = sum(f.stat().st_size for f in dist_root.rglob("*") if f.is_file())
+    log(f"  PyInstaller complete: {dist_size / 1024 / 1024:.0f} MB in {dist_label}")
 
 
 # ─── Step 4: Verify Frozen Build ─────────────────────────────────────
@@ -252,8 +267,12 @@ def verify_build():
     """Run the frozen executable to verify it works."""
     log("Step 4: Verifying frozen build...")
 
-    exe_name = "librarian.exe" if platform.system() == "Windows" else "librarian"
-    exe_path = DIST_DIR / "librarian" / exe_name
+    if platform.system() == "Darwin":
+        exe_path = DIST_DIR / "The Librarian.app" / "Contents" / "MacOS" / "librarian"
+    elif platform.system() == "Windows":
+        exe_path = DIST_DIR / "librarian" / "librarian.exe"
+    else:
+        exe_path = DIST_DIR / "librarian" / "librarian"
 
     if not exe_path.exists():
         raise FileNotFoundError(f"Executable not found: {exe_path}")
@@ -393,8 +412,16 @@ def main():
         print("BUILD SUMMARY")
         print("=" * 60)
         print(f"  Mode:        {build_mode.upper()}")
-        print(f"  Frozen app:  dist/librarian/")
-        print(f"  Installer:   dist/librarian/librarian.exe  (double-click to install)")
+        print(f"  Platform:    {platform.system()} {platform.machine()}")
+        if platform.system() == "Darwin":
+            print(f"  App bundle:  dist/The Librarian.app/")
+            print(f"  Executable:  dist/The Librarian.app/Contents/MacOS/librarian")
+        elif platform.system() == "Windows":
+            print(f"  Frozen app:  dist/librarian/")
+            print(f"  Installer:   dist/librarian/librarian.exe  (double-click to install)")
+        else:
+            print(f"  Frozen app:  dist/librarian/")
+            print(f"  Executable:  dist/librarian/librarian")
         print(f"  Version:     version.json")
         print(f"  Duration:    {elapsed / 60:.1f} min")
         print("=" * 60)
