@@ -73,6 +73,14 @@ if IS_LEAN:
         "numpy.lib",
         "numpy.lib.format",
         "onnxruntime",
+        # Tokenizer for ONNX model
+        "tokenizers",
+        "tokenizers.implementations",
+        "tokenizers.models",
+        "tokenizers.normalizers",
+        "tokenizers.pre_tokenizers",
+        "tokenizers.processors",
+        "tokenizers.decoders",
         # Networking for Anthropic SDK
         "anthropic",
         "httpx",
@@ -186,7 +194,10 @@ onnx_model_dir = os.path.join(SPEC_DIR, "lib", "models", "all-MiniLM-L6-v2")
 for onnx_file in ["model.onnx", "tokenizer.json"]:
     onnx_path = os.path.join(onnx_model_dir, onnx_file)
     if os.path.isfile(onnx_path):
+        # _cowork_source/ path: for extraction into user workspaces
         datas += [(onnx_path, os.path.join("_cowork_source", "models", "all-MiniLM-L6-v2"))]
+        # models/ path: for direct use by the frozen binary via sys._MEIPASS
+        datas += [(onnx_path, os.path.join("models", "all-MiniLM-L6-v2"))]
 
 # ─── Exclusions ───────────────────────────────────────────────────────
 # Always exclude dev/test tools
@@ -199,10 +210,10 @@ excludes = [
 
 if IS_LEAN:
     # Lean build: exclude the heavy ML stack (PyTorch, sentence-transformers).
-    # Keep numpy + onnxruntime — the lean build uses ONNX for embeddings.
+    # Keep numpy, onnxruntime, tokenizers — the lean build uses ONNX for embeddings.
     excludes += [
         "torch", "sentence_transformers", "transformers",
-        "tokenizers", "safetensors", "huggingface_hub",
+        "safetensors", "huggingface_hub",
     ]
 else:
     # Full build: just strip CUDA (we're CPU-only)

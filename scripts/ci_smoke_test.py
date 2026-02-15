@@ -171,7 +171,7 @@ def main():
         )
 
         # ── Test 2: Boot ──
-        t.run(
+        _, boot_stdout, _ = t.run(
             "Boot produces valid session",
             ["boot", "--compact"],
             timeout=TIMEOUT_BOOT,
@@ -211,10 +211,12 @@ def main():
             ],
         )
 
-        # ── Test 6: Check embedding strategy ──
-        rc, stdout, stderr = t.run(
+        # ── Test 6: Check embedding strategy (from boot output) ──
+        # embedding_strategy is reported in boot --compact, not stats
+        t.run(
             "Embedding strategy is ONNX",
-            ["stats"],
+            ["boot", "--compact"],
+            timeout=TIMEOUT_BOOT,
             checks=[
                 ("exits cleanly", lambda rc, out, err: rc == 0),
                 ("reports ONNX", lambda rc, out, err: "onnx" in out.lower()),
