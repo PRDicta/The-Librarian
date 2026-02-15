@@ -43,6 +43,8 @@ jobs:
           pip install -r requirements-onnx.txt
 
       - name: Export ONNX model
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           pip install torch sentence-transformers onnx onnxscript
           python scripts/export_onnx_model.py
