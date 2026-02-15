@@ -1024,11 +1024,11 @@ async def cmd_recall(query, source_type=None):
         meta_parts.append(f"{len(all_candidates)} candidates")
         if entity_count > 0:
             meta_parts.append(f"{entity_count} entities")
-        print(f"[{' | '.join(meta_parts)}]")
+        print(f"[{' | '.join(meta_parts)}]", flush=True)
 
-        print(lib.get_context_block(synthetic_response))
+        print(lib.get_context_block(synthetic_response), flush=True)
     else:
-        print("No relevant memories found.")
+        print("No relevant memories found.", flush=True)
 
     close_db(lib)
 
