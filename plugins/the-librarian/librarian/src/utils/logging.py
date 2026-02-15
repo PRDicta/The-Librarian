@@ -1,6 +1,8 @@
-
-
-
+"""
+The Librarian — Debug Logging
+Formatted debug output for Librarian activity.
+Uses rich for terminal formatting.
+"""
 from typing import Dict, Any, List, Optional
 from rich.console import Console
 from rich.panel import Panel
@@ -9,26 +11,26 @@ from rich.text import Text
 from ..core.types import RolodexEntry, LibrarianResponse, SessionInfo
 console = Console()
 def print_debug_info(debug: Dict[str, Any]):
-
+    """Print a debug panel showing what the Librarian did this turn."""
     if not any([
         debug.get("entries_indexed", 0) > 0,
         debug.get("gap_detected", False),
         debug.get("retrieval_performed", False),
     ]):
-
+        # Nothing interesting happened
         if debug.get("librarian_active"):
             console.print("[dim]  📚 Librarian: monitoring (no action needed)[/dim]")
         return
     lines = []
-
+    # Indexing
     n_indexed = debug.get("entries_indexed", 0)
     if n_indexed > 0:
         lines.append(f"[green]📥 Indexed {n_indexed} new entries[/green]")
-
+    # Gap detection
     if debug.get("gap_detected"):
         topic = debug.get("gap_topic", "unknown")
         lines.append(f"[yellow]🔍 Gap detected: \"{topic}\"[/yellow]")
-
+    # Retrieval
     if debug.get("retrieval_performed"):
         if debug.get("retrieval_found"):
             n_results = debug.get("retrieval_entries", 0)
@@ -39,7 +41,7 @@ def print_debug_info(debug: Dict[str, Any]):
             )
         else:
             lines.append("[red]❌ No matching entries found — falling back to user[/red]")
-
+    # Preloading (Phase 3)
     if debug.get("preload_performed"):
         strategy = debug.get("preload_strategy", "none")
         pressure = debug.get("preload_pressure", 0)
@@ -58,7 +60,7 @@ def print_debug_info(debug: Dict[str, Any]):
             lines.append(
                 f"[cyan]   ↳ Warmed {cached} entries into hot cache[/cyan]"
             )
-
+    # Tier events (Phase 2)
     tier_events = debug.get("tier_events", [])
     if tier_events:
         for event in tier_events:
@@ -67,7 +69,7 @@ def print_debug_info(debug: Dict[str, Any]):
                 f"[magenta]{direction}: entry {event.entry_id[:8]}… "
                 f"(score: {event.score:.2f})[/magenta]"
             )
-
+    # Tier sweep
     if debug.get("tier_sweep_performed"):
         summary = debug.get("tier_sweep_summary", {})
         lines.append(
@@ -75,20 +77,20 @@ def print_debug_info(debug: Dict[str, Any]):
             f"promoted {summary.get('promoted', 0)}, "
             f"demoted {summary.get('demoted', 0)}[/blue]"
         )
-
+    # Cross-session results (Phase 4)
     cross_session = debug.get("cross_session_results", 0)
     if cross_session > 0:
         lines.append(
             f"[blue]🌐 {cross_session} result(s) from prior sessions[/blue]"
         )
-
+    # Errors
     if debug.get("indexing_error"):
         lines.append(f"[red]⚠ Indexing error: {debug['indexing_error']}[/red]")
     content = "\n".join(lines)
     console.print(Panel(content, title="[bold blue]📚 Librarian[/bold blue]",
                         border_style="blue", padding=(0, 1)))
 def print_stats(stats: Dict[str, Any]):
-
+    """Print a formatted stats table."""
     table = Table(title="📊 The Librarian — Session Stats", border_style="blue")
     table.add_column("Metric", style="bold")
     table.add_column("Value", justify="right")
@@ -101,7 +103,7 @@ def print_stats(stats: Dict[str, Any]):
     table.add_row("Cold Storage Entries", str(stats.get("cold_storage_entries", 0)))
     table.add_row("Entries Created (session)", str(stats.get("total_entries_created", 0)))
     table.add_row("Last Indexed Turn", str(stats.get("last_indexed_turn", 0)))
-
+    # Tier distribution (Phase 2)
     tier_dist = stats.get("tier_distribution", {})
     if tier_dist:
         tier_str = ", ".join(f"{k}: {v}" for k, v in tier_dist.items())
@@ -109,7 +111,7 @@ def print_stats(stats: Dict[str, Any]):
     avg_score = stats.get("avg_hot_score", 0)
     if avg_score:
         table.add_row("Avg HOT Score", f"{avg_score:.3f}")
-
+    # Pressure stats (Phase 3)
     pressure_info = stats.get("pressure", {})
     if pressure_info:
         table.add_row("Session Pressure", f"{pressure_info.get('pressure', 0):.1%}")
@@ -117,7 +119,7 @@ def print_stats(stats: Dict[str, Any]):
         table.add_row("Total Gaps", str(pressure_info.get("total_gaps", 0)))
         hit_rate = pressure_info.get("cache_hit_rate", 0)
         table.add_row("Cache Hit Rate", f"{hit_rate:.0%}")
-
+    # Phase 4: session info
     total_sessions = stats.get("total_sessions", 0)
     if total_sessions:
         table.add_row("Total Sessions", str(total_sessions))
@@ -129,7 +131,7 @@ def print_stats(stats: Dict[str, Any]):
         table.add_row("Categories", cats_str)
     console.print(table)
 def print_search_results(response: LibrarianResponse):
-
+    """Print search results in a formatted way."""
     if not response.found:
         console.print("[yellow]No results found.[/yellow]")
         return
@@ -149,7 +151,7 @@ def print_search_results(response: LibrarianResponse):
             padding=(0, 1),
         ))
 def print_welcome():
-
+    """Print welcome banner."""
     console.print()
     console.print(Panel(
         "[bold]The Librarian[/bold] — Three-Tier Memory Architecture\n"
@@ -162,7 +164,7 @@ def print_welcome():
 
 
 def print_librarian_activation():
-
+    """Print when the Librarian comes online."""
     console.print(Panel(
         "[bold green]📚 Librarian is now active[/bold green]\n"
         "[dim]Indexing conversation content. Memory retrieval enabled.[/dim]",
@@ -171,11 +173,13 @@ def print_librarian_activation():
     ))
 
 
+# ─── Phase 4: Session Display Helpers ─────────────────────────────────────
+
 def print_session_list(
     sessions: List[SessionInfo],
     current_session_id: Optional[str] = None,
 ):
-
+    """Print a formatted table of past sessions."""
     if not sessions:
         console.print("[dim]No sessions found.[/dim]")
         return
@@ -220,7 +224,7 @@ def print_session_list(
 
 
 def print_session_resumed(session_info: SessionInfo):
-
+    """Print a banner when resuming a session."""
     short_id = session_info.session_id[:8]
     started = session_info.started_at.strftime("%Y-%m-%d %H:%M")
     console.print(Panel(

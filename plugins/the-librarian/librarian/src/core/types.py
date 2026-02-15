@@ -76,6 +76,10 @@ class RolodexEntry:
     linked_ids: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     verbatim_source: bool = True  # True = original user/assistant text; False = summary/paraphrase
+    # Phase 12: Document source tracking
+    source_type: str = "conversation"         # conversation | document | user_knowledge
+    document_id: Optional[str] = None         # FK to documents.id (nullable)
+    source_location: str = ""                 # Free-text: "§3.2, p12, heading: Authentication"
 @dataclass
 class ConversationState:
     """Tracks the full state of an active conversation."""

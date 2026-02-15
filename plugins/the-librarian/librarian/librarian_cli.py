@@ -42,12 +42,139 @@ FUSE_CLEANUP_INTERVAL = 10
 # Deferred to first use so the process starts fast for simple commands.
 _TheLibrarian = None
 _LibrarianConfig = None
+_deps_checked = False
+
+
+def _ensure_dependencies():
+    """Auto-install pip dependencies on first run inside Cowork VM.
+
+    The frozen Windows .exe bundles everything, but when Cowork's Linux VM
+    runs the Python source directly, packages like sentence-transformers and
+    torch may not be installed.
+
+    Strategy: install core deps first (small, always succeed), then attempt
+    ML deps separately (large, may fail on disk-constrained VMs). If ML
+    deps fail, the embedding system falls back to hash-based mode.
+
+    Only runs once per process. Skips entirely if we're in a frozen build.
+    """
+    global _deps_checked
+    if _deps_checked or getattr(sys, 'frozen', False):
+        return
+    _deps_checked = True
+
+    # Check for cached dependency status (avoids re-probing every boot)
+    deps_flag = os.path.join(SCRIPT_DIR, ".deps_ok")
+    if os.path.isfile(deps_flag):
+        try:
+            # Verify the flag is fresh (less than 7 days old)
+            import time as _time
+            age = _time.time() - os.path.getmtime(deps_flag)
+            if age < 7 * 86400:  # 7 days
+                return
+        except OSError:
+            pass
+
+    import subprocess as _sp
+    pip_base = [sys.executable, "-m", "pip", "install",
+                "--break-system-packages", "-q", "--disable-pip-version-check"]
+
+    # Step 1: Check if core deps are present
+    core_missing = False
+    for probe in ["anthropic", "rich"]:
+        try:
+            __import__(probe)
+        except ImportError:
+            core_missing = True
+            break
+
+    # Step 2: Install core deps if needed (lightweight, ~5 MB)
+    if core_missing:
+        req_core = os.path.join(SCRIPT_DIR, "requirements.txt")
+        if os.path.isfile(req_core):
+            try:
+                _sp.run(pip_base + ["-r", req_core, "--no-cache-dir"],
+                        timeout=120, capture_output=True)
+            except Exception:
+                pass
+
+    # Step 3: Check if we have a viable embedding backend
+    # Priority: sentence-transformers > onnxruntime+tokenizers > hash fallback
+    has_embeddings = False
+    try:
+        import sentence_transformers  # noqa: F401
+        has_embeddings = True
+    except ImportError:
+        pass
+
+    if not has_embeddings:
+        # Check if ONNX Runtime AND tokenizers are both available
+        onnx_ready = False
+        try:
+            import onnxruntime  # noqa: F401
+            import tokenizers  # noqa: F401
+            onnx_ready = True
+            has_embeddings = True
+        except ImportError:
+            pass
+
+        # If ONNX Runtime exists but tokenizers is missing, install just tokenizers
+        if not onnx_ready:
+            try:
+                import onnxruntime  # noqa: F401
+                # onnxruntime present but tokenizers missing — lightweight install
+                req_onnx = os.path.join(SCRIPT_DIR, "requirements-onnx.txt")
+                if os.path.isfile(req_onnx):
+                    try:
+                        _sp.run(pip_base + ["-r", req_onnx, "--no-cache-dir"],
+                                timeout=120, capture_output=True)
+                        has_embeddings = True
+                    except Exception:
+                        pass
+            except ImportError:
+                pass  # No onnxruntime at all
+
+    # Step 4: Only attempt heavy ML deps if no embedding backend exists
+    if not has_embeddings:
+        # Try ONNX tier first (lightweight, ~55 MB)
+        req_onnx = os.path.join(SCRIPT_DIR, "requirements-onnx.txt")
+        if os.path.isfile(req_onnx):
+            try:
+                _sp.run(pip_base + ["-r", req_onnx, "--no-cache-dir"],
+                        timeout=120, capture_output=True)
+                # Check if it worked
+                try:
+                    import onnxruntime  # noqa: F401
+                    import tokenizers  # noqa: F401
+                    has_embeddings = True
+                except ImportError:
+                    pass
+            except Exception:
+                pass
+
+    if not has_embeddings:
+        # Last resort: full ML stack (~2 GB)
+        req_ml = os.path.join(SCRIPT_DIR, "requirements-ml.txt")
+        if os.path.isfile(req_ml):
+            try:
+                _sp.run(pip_base + ["-r", req_ml, "--no-cache-dir"],
+                        timeout=300, capture_output=True)
+            except Exception:
+                pass  # ML deps failed (likely disk space) — hash fallback will activate
+
+    # Write cache flag so subsequent boots skip all of this
+    try:
+        with open(deps_flag, "w") as f:
+            f.write("ok")
+    except OSError:
+        pass  # FUSE mount may not support this — non-fatal
 
 
 def _lazy_imports():
     """Import heavy modules on first use."""
     global _TheLibrarian, _LibrarianConfig
     if _TheLibrarian is None:
+        _ensure_dependencies()
         from src.core.librarian import TheLibrarian
         from src.utils.config import LibrarianConfig
         _TheLibrarian = TheLibrarian
@@ -79,11 +206,169 @@ def _build_adapter():
         return None, "verbatim"
 
 
+def _clean_db_satellites(db_path):
+    """Best-effort removal of journal/wal/shm files alongside a DB."""
+    for suffix in ("-wal", "-journal", "-shm"):
+        try:
+            p = db_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def _check_db_health(db_path):
+    """Detect and recover from corrupt/0-byte DB files.
+
+    Returns the db_path to use (may differ from input if recovery required
+    overwrite instead of delete). Returns None if the file doesn't exist yet
+    (caller should let TheLibrarian create a fresh one).
+    """
+    if not os.path.exists(db_path):
+        return db_path  # Doesn't exist yet — will be created fresh
+
+    is_corrupt = False
+
+    if os.path.getsize(db_path) == 0:
+        is_corrupt = True
+        detail = "0-byte rolodex.db"
+    else:
+        # Quick SQLite header check
+        try:
+            with open(db_path, "rb") as f:
+                header = f.read(16)
+            if not header.startswith(b"SQLite format 3"):
+                is_corrupt = True
+                detail = "non-SQLite rolodex.db"
+        except OSError:
+            is_corrupt = True
+            detail = "unreadable rolodex.db"
+
+    if not is_corrupt:
+        return db_path
+
+    # Strategy 1: try to delete the corrupt file
+    try:
+        os.remove(db_path)
+        _clean_db_satellites(db_path)
+        print(json.dumps({"housekeeping": "corrupt_db_recovery",
+                          "detail": f"Removed {detail}"}),
+              file=sys.stderr)
+        return db_path
+    except OSError:
+        pass
+
+    # Strategy 2: overwrite with a minimal valid SQLite DB
+    # (for filesystems that allow write but not delete)
+    try:
+        import sqlite3
+        import tempfile
+        # Create a valid DB in a temp location, then copy over
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+        conn = sqlite3.connect(tmp_path)
+        conn.execute("CREATE TABLE _recovery (id INTEGER PRIMARY KEY)")
+        conn.execute("DROP TABLE _recovery")
+        conn.close()
+        import shutil
+        shutil.copy2(tmp_path, db_path)
+        os.remove(tmp_path)
+        _clean_db_satellites(db_path)
+        print(json.dumps({"housekeeping": "corrupt_db_recovery",
+                          "detail": f"Overwrote {detail} with fresh DB"}),
+              file=sys.stderr)
+        return db_path
+    except OSError:
+        pass
+
+    # Strategy 3: neither delete nor overwrite worked — this path is unusable
+    return None
+
+
+def _test_sqlite_writable(db_path):
+    """Quick check: can SQLite actually open and write to this path?
+
+    Returns True if a table can be created and dropped, False otherwise.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute("CREATE TABLE IF NOT EXISTS _probe (id INTEGER PRIMARY KEY)")
+        conn.execute("DROP TABLE IF EXISTS _probe")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_db_path():
+    """Determine the best writable DB path, with fallback chain.
+
+    Order:
+    1. DB_PATH (default: alongside librarian_cli.py, or LIBRARIAN_DB_PATH env)
+    2. If corrupt → try to recover in-place
+    3. If mounted FS blocks SQLite → fall back to session-local writable path
+    4. Last resort → /tmp/rolodex.db (ephemeral, won't persist)
+
+    Returns (db_path, fallback_used) tuple.
+    """
+    # Step 1: health check (handles corrupt/0-byte files)
+    resolved = _check_db_health(DB_PATH)
+
+    if resolved is not None:
+        # Step 2: verify SQLite can actually operate here
+        if _test_sqlite_writable(resolved):
+            return resolved, False
+
+        # SQLite can't write — mounted FS issue
+        print(json.dumps({"housekeeping": "sqlite_fs_incompatible",
+                          "detail": f"SQLite cannot operate at {resolved}, trying fallback"}),
+              file=sys.stderr)
+
+    # Step 3: try session-local writable path (persists within session)
+    # /sessions/<slug>/ root is writable even when mnt/ has FS constraints
+    session_root = None
+    cwd = os.getcwd()
+    # Detect session root from CWD or DB_PATH
+    for path in [cwd, DB_PATH]:
+        parts = path.split("/sessions/")
+        if len(parts) > 1:
+            slug = parts[1].split("/")[0]
+            candidate = f"/sessions/{slug}/rolodex.db"
+            if _test_sqlite_writable(candidate):
+                session_root = candidate
+                break
+
+    if session_root:
+        print(json.dumps({"housekeeping": "db_fallback",
+                          "detail": f"Using session-local DB at {session_root}",
+                          "warning": "DB will not persist after session ends unless copied back"}),
+              file=sys.stderr)
+        return session_root, True
+
+    # Step 4: last resort — /tmp
+    tmp_path = "/tmp/rolodex.db"
+    if _test_sqlite_writable(tmp_path):
+        print(json.dumps({"housekeeping": "db_fallback",
+                          "detail": f"Using ephemeral DB at {tmp_path}",
+                          "warning": "DB will not persist after session ends"}),
+              file=sys.stderr)
+        return tmp_path, True
+
+    # Nothing works — let it fail naturally so the error is visible
+    return DB_PATH, False
+
+
 def _make_librarian():
     """Create TheLibrarian with adapter if available."""
     _lazy_imports()
+    db_path, fallback_used = _resolve_db_path()
     adapter, mode = _build_adapter()
-    return _TheLibrarian(db_path=DB_PATH, llm_adapter=adapter), mode
+    lib = _TheLibrarian(db_path=db_path, llm_adapter=adapter)
+    if fallback_used:
+        lib._db_fallback = True
+        lib._db_original_path = DB_PATH
+    return lib, mode
 
 
 def load_session_id():
@@ -320,6 +605,48 @@ async def cmd_boot(compact=False, full_context=False):
     window_state = lib.context_window.get_state(lib.state.messages)
     bridge = lib.context_window.bridge_summary
 
+    # ─── Phase 13: Suggest focus areas for session start ─────────────────
+    suggested_focus = None
+    try:
+        from src.indexing.project_clusterer import ProjectClusterer
+        pc = ProjectClusterer(lib.rolodex.conn)
+        focus_suggestions = pc.suggest_focus(limit=3)
+        if focus_suggestions:
+            from datetime import datetime as _dt
+            _now = _dt.utcnow()
+            for s in focus_suggestions:
+                if s.get("last_active"):
+                    try:
+                        la = _dt.fromisoformat(s["last_active"])
+                        delta = _now - la
+                        if delta.days == 0:
+                            hours = delta.seconds // 3600
+                            s["last_active_relative"] = "just now" if hours == 0 else f"{hours}h ago"
+                        elif delta.days == 1:
+                            s["last_active_relative"] = "yesterday"
+                        else:
+                            s["last_active_relative"] = f"{delta.days}d ago"
+                    except (ValueError, TypeError):
+                        s["last_active_relative"] = "unknown"
+            suggested_focus = focus_suggestions
+    except Exception:
+        pass  # Graceful degradation if clusters aren't built yet
+
+    # ─── Detect embedding strategy and build warnings ──────────────────
+    embedding_strategy = getattr(lib.embeddings, 'strategy', 'unknown')
+    warnings = []
+    if embedding_strategy == "hash":
+        warnings.append(
+            "Semantic embeddings unavailable — using hash-based fallback. "
+            "Search will work but relies on keyword overlap rather than meaning. "
+            "This is normal on first boot if ML dependencies are still installing."
+        )
+    if mode == "verbatim":
+        warnings.append(
+            "No API key detected — running in verbatim mode. "
+            "Ingestion uses heuristic extraction instead of LLM-enhanced summarization."
+        )
+
     # ─── Compact boot: fast path ─────────────────────────────────────────
     if compact:
         # Return only the lightweight essentials — no manifest, no instructions
@@ -337,6 +664,7 @@ async def cmd_boot(compact=False, full_context=False):
             "user_knowledge_entries": len(uk_entries),
             "past_sessions": len(past_sessions),
             "user_profile": user_profile_json,
+            "embedding_strategy": embedding_strategy,
             "context_block": context_block,
             "context_window": {
                 "active_messages": window_state.active_messages,
@@ -347,6 +675,12 @@ async def cmd_boot(compact=False, full_context=False):
                 "bridge_summary": bridge if bridge else None,
             },
         }
+
+        if warnings:
+            output["warnings"] = warnings
+
+        if suggested_focus:
+            output["suggested_focus"] = suggested_focus
 
         # Housekeeping
         _cleanup_fuse_hidden()
@@ -504,7 +838,8 @@ def _get_entry_category(cat_str):
         return EntryCategory.NOTE
 
 
-async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, is_summary=False):
+async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, is_summary=False,
+                     doc_id=None, source_location=None):
     """Ingest a message into the rolodex."""
     lib, _ = _make_librarian()
     _ensure_session(lib, caller="ingest")
@@ -533,6 +868,15 @@ async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, i
     if corrects_id and entries:
         lib.rolodex.supersede_entry(corrects_id, entries[0].id)
 
+    # Phase 12: Handle --doc and --loc flags (document source citation)
+    if doc_id and entries:
+        for entry in entries:
+            lib.rolodex.update_entry_document_source(
+                entry_id=entry.id,
+                document_id=doc_id,
+                source_location=source_location or "",
+            )
+
     # Phase 9: Include checkpoint and window state
     window = lib.context_window.get_stats()
 
@@ -549,6 +893,10 @@ async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, i
     }
     if as_user_knowledge:
         result["user_knowledge"] = True
+    if doc_id:
+        result["document_id"] = doc_id
+        if source_location:
+            result["source_location"] = source_location
 
     close_db(lib)
     print(json.dumps(result))
@@ -592,7 +940,7 @@ async def cmd_batch_ingest(json_path):
     }))
 
 
-async def cmd_recall(query):
+async def cmd_recall(query, source_type=None):
     """Search memory, return formatted context block.
 
     Phase 11: Wide-net-then-narrow search pattern.
@@ -601,6 +949,8 @@ async def cmd_recall(query):
     3. Re-ranker narrows using 5 signals: semantic, entity match, category,
        recency, access frequency
     4. Return top 5 re-ranked results
+
+    Phase 12: Optional --source filter ('conversation', 'document', 'user_knowledge').
     """
     lib, _ = _make_librarian()
     _ensure_session(lib, caller="recall")
@@ -621,6 +971,9 @@ async def cmd_recall(query):
         response = await lib.retrieve(variant, limit=WIDE_NET_LIMIT)
         if response.found:
             for entry in response.entries:
+                # Phase 12: Filter by source_type if specified
+                if source_type and getattr(entry, 'source_type', 'conversation') != source_type:
+                    continue
                 if entry.id not in seen_ids:
                     seen_ids.add(entry.id)
                     # Use search position as a proxy score (first = highest)
@@ -718,6 +1071,14 @@ async def cmd_end(summary=""):
 
         mm.refine_manifest(current_manifest, session_id, available_budget)
         manifest_refined = True
+
+    # Phase 13: Update project clusters with this session's topic data
+    try:
+        from src.indexing.project_clusterer import ProjectClusterer
+        pc = ProjectClusterer(lib.rolodex.conn)
+        pc.update_clusters_for_session(session_id)
+    except Exception:
+        pass  # Non-fatal — clusters will rebuild on next boot if needed
 
     lib.end_session(summary=summary)
     clear_session_file()
@@ -1282,6 +1643,599 @@ async def cmd_manifest(subcmd, args):
     close_db(lib)
 
 
+# ─── Browse Formatting Helpers ────────────────────────────────────────
+
+def _format_browse_entry(entry, compact=True):
+    """Format a single RolodexEntry for browse output."""
+    eid = entry.id[:8]
+    cat = entry.category.value.upper()
+    src = getattr(entry, 'source_type', 'conversation') or 'conversation'
+    tier = entry.tier.value
+    access = entry.access_count
+    created = entry.created_at.strftime("%Y-%m-%d %H:%M") if entry.created_at else "?"
+    tags = ", ".join(entry.tags) if entry.tags else ""
+
+    header = f"[{eid}] [{cat}] [{src}] created: {created}  accessed: {access}x  tier: {tier}"
+    lines = [header]
+
+    if tags:
+        lines.append(f"  Tags: {tags}")
+
+    doc_id = getattr(entry, 'document_id', None)
+    loc = getattr(entry, 'source_location', '')
+    if doc_id:
+        source_line = f"  Source: doc:{doc_id[:8]}"
+        if loc:
+            source_line += f" {loc}"
+        lines.append(source_line)
+
+    lines.append("  ───")
+    if compact:
+        preview = entry.content[:200].replace("\n", " ")
+        if len(entry.content) > 200:
+            preview += "..."
+        lines.append(f"  {preview}")
+    else:
+        for line in entry.content.split("\n"):
+            lines.append(f"  {line}")
+    lines.append("  ═══")
+    return "\n".join(lines)
+
+
+def _format_browse_list(entries, title="", compact=True):
+    """Format a list of entries for browse output."""
+    parts = []
+    if title:
+        parts.append(f"{'─' * 60}")
+        parts.append(f"  {title} ({len(entries)} entries)")
+        parts.append(f"{'─' * 60}")
+    for entry in entries:
+        parts.append(_format_browse_entry(entry, compact=compact))
+    return "\n".join(parts)
+
+
+# ─── Browse Command ───────────────────────────────────────────────────
+
+def _entry_to_dict(entry, compact=True):
+    """Serialize a RolodexEntry to a JSON-friendly dict."""
+    d = {
+        "id": entry.id[:8],
+        "full_id": entry.id,
+        "category": entry.category.value.upper(),
+        "source_type": getattr(entry, 'source_type', 'conversation') or 'conversation',
+        "tier": entry.tier.value,
+        "access_count": entry.access_count,
+        "created_at": entry.created_at.strftime("%Y-%m-%d %H:%M") if entry.created_at else None,
+        "tags": entry.tags or [],
+    }
+    doc_id = getattr(entry, 'document_id', None)
+    if doc_id:
+        d["document_id"] = doc_id[:8]
+        d["source_location"] = getattr(entry, 'source_location', '') or ''
+
+    if compact:
+        preview = entry.content[:200].replace("\n", " ")
+        if len(entry.content) > 200:
+            preview += "..."
+        d["content"] = preview
+    else:
+        d["content"] = entry.content
+
+    return d
+
+
+async def cmd_browse(subcmd, args, as_json=False):
+    """Browse the rolodex — view entries, filter by category/source/topic.
+
+    --json flag outputs structured JSON for programmatic / in-chat display.
+    """
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="browse")
+
+    if subcmd == "recent":
+        limit = int(args[0]) if args else 20
+        entries = lib.rolodex.browse_recent(limit)
+        if as_json:
+            print(json.dumps({"title": "Most Recent Entries", "count": len(entries),
+                              "entries": [_entry_to_dict(e) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title="Most Recent Entries", compact=True))
+
+    elif subcmd == "category":
+        if not args:
+            print(json.dumps({"error": "Usage: browse category <category> [limit]"}))
+            close_db(lib)
+            sys.exit(1)
+        cat = args[0]
+        limit = int(args[1]) if len(args) > 1 else 20
+        entries = lib.rolodex.get_entries_by_category(cat, limit=limit)
+        if as_json:
+            print(json.dumps({"title": f"Category: {cat}", "count": len(entries),
+                              "entries": [_entry_to_dict(e) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title=f"Category: {cat}", compact=True))
+
+    elif subcmd == "source":
+        if not args:
+            print(json.dumps({"error": "Usage: browse source <conversation|document|user_knowledge> [limit]"}))
+            close_db(lib)
+            sys.exit(1)
+        source = args[0]
+        limit = int(args[1]) if len(args) > 1 else 20
+        entries = lib.rolodex.browse_by_source_type(source, limit=limit)
+        if as_json:
+            print(json.dumps({"title": f"Source: {source}", "count": len(entries),
+                              "entries": [_entry_to_dict(e) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title=f"Source: {source}", compact=True))
+
+    elif subcmd == "topic":
+        if not args:
+            print(json.dumps({"error": "Usage: browse topic <topic_id> [limit]"}))
+            close_db(lib)
+            sys.exit(1)
+        topic_id = args[0]
+        limit = int(args[1]) if len(args) > 1 else 20
+        entries = lib.rolodex.get_entries_by_topic(topic_id, limit=limit)
+        topic = lib.rolodex.get_topic(topic_id)
+        label = topic["label"] if topic else topic_id
+        if as_json:
+            print(json.dumps({"title": f"Topic: {label}", "count": len(entries),
+                              "entries": [_entry_to_dict(e) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title=f"Topic: {label}", compact=True))
+
+    elif subcmd == "entry":
+        if not args:
+            print(json.dumps({"error": "Usage: browse entry <entry_id or prefix>"}))
+            close_db(lib)
+            sys.exit(1)
+        entry_id = args[0]
+        entry = lib.rolodex.get_entry(entry_id)
+        if not entry:
+            entry = lib.rolodex.browse_entry_by_prefix(entry_id)
+        if not entry:
+            print(json.dumps({"error": f"Entry not found: {entry_id}"}))
+            close_db(lib)
+            sys.exit(1)
+        if as_json:
+            d = _entry_to_dict(entry, compact=False)
+            d["full_id"] = entry.id
+            d["conversation_id"] = entry.conversation_id
+            d["content_type"] = entry.content_type.value
+            d["verbatim_source"] = entry.verbatim_source
+            d["document_id_full"] = getattr(entry, 'document_id', None)
+            d["source_location"] = getattr(entry, 'source_location', '') or ''
+            d["linked_ids"] = entry.linked_ids or None
+            d["metadata"] = entry.metadata or None
+            print(json.dumps({"title": f"Entry: {entry.id[:8]}", "entry": d}, indent=2))
+        else:
+            output = _format_browse_entry(entry, compact=False)
+            meta_lines = [
+                output,
+                f"  ── Full Metadata ──",
+                f"  ID:              {entry.id}",
+                f"  Conversation:    {entry.conversation_id}",
+                f"  Content Type:    {entry.content_type.value}",
+                f"  Verbatim:        {entry.verbatim_source}",
+                f"  Source Type:     {getattr(entry, 'source_type', 'conversation')}",
+                f"  Document ID:     {getattr(entry, 'document_id', None) or '—'}",
+                f"  Source Location: {getattr(entry, 'source_location', '') or '—'}",
+                f"  Linked IDs:      {entry.linked_ids or '—'}",
+                f"  Metadata:        {json.dumps(entry.metadata) if entry.metadata else '—'}",
+            ]
+            print("\n".join(meta_lines))
+
+    elif subcmd == "knowledge":
+        entries = lib.rolodex.get_user_knowledge_entries()
+        if as_json:
+            print(json.dumps({"title": "User Knowledge (always loaded)", "count": len(entries),
+                              "entries": [_entry_to_dict(e, compact=False) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title="User Knowledge (always loaded)", compact=False))
+
+    elif subcmd == "sessions":
+        limit = int(args[0]) if args else 20
+        sessions = lib.rolodex.get_session_summaries(limit)
+        if as_json:
+            session_list = []
+            for s in sessions:
+                session_list.append({
+                    "id": s["session_id"][:8],
+                    "full_id": s["session_id"],
+                    "created_at": s["created_at"][:16] if s["created_at"] else None,
+                    "status": s["status"],
+                    "entry_count": s["entry_count"],
+                    "summary": s["summary"][:120] if s["summary"] else None,
+                })
+            print(json.dumps({"title": "Sessions", "count": len(sessions),
+                              "sessions": session_list}, indent=2))
+        else:
+            parts = [
+                f"{'─' * 60}",
+                f"  Sessions ({len(sessions)} shown)",
+                f"{'─' * 60}",
+            ]
+            for s in sessions:
+                sid = s["session_id"][:8]
+                created = s["created_at"][:16] if s["created_at"] else "?"
+                status = s["status"]
+                count = s["entry_count"]
+                summary = s["summary"][:80] if s["summary"] else "—"
+                parts.append(f"  [{sid}] {created}  entries: {count}  status: {status}")
+                parts.append(f"    {summary}")
+            print("\n".join(parts))
+
+    elif subcmd == "search":
+        if not args:
+            print(json.dumps({"error": "Usage: browse search <query> [limit]"}))
+            close_db(lib)
+            sys.exit(1)
+        query = args[0]
+        limit = int(args[1]) if len(args) > 1 else 10
+        results = lib.rolodex.keyword_search(query, limit=limit)
+        entries = [entry for entry, score in results]
+        if as_json:
+            print(json.dumps({"title": f'Search: "{query}"', "count": len(entries),
+                              "entries": [_entry_to_dict(e) for e in entries]}, indent=2))
+        else:
+            print(_format_browse_list(entries, title=f'Search: "{query}"', compact=True))
+
+    else:
+        print(json.dumps({
+            "error": f"Unknown browse subcommand: {subcmd}",
+            "usage": "browse recent|category|source|topic|entry|knowledge|sessions|search [--json]"
+        }))
+        sys.exit(1)
+
+    close_db(lib)
+
+
+async def cmd_register_doc(file_path, title=None):
+    """Register a document in the document registry (Phase 12).
+
+    Extracts metadata (title, page count, hash) without reading full content.
+    The document is read on-demand via read-doc when needed.
+    """
+    from src.indexing.doc_readers import get_document_metadata, detect_file_type
+
+    file_type = detect_file_type(file_path)
+    if file_type == "unknown":
+        print(json.dumps({"error": f"Unsupported file type: {os.path.splitext(file_path)[1]}"}))
+        sys.exit(1)
+
+    if not os.path.isfile(file_path):
+        print(json.dumps({"error": f"File not found: {file_path}"}))
+        sys.exit(1)
+
+    meta = get_document_metadata(file_path)
+    doc_id = str(__import__("uuid").uuid4())
+
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="register-doc")
+
+    lib.rolodex.register_document(
+        doc_id=doc_id,
+        file_name=meta.file_name,
+        file_path=os.path.abspath(file_path),
+        file_type=meta.file_type,
+        file_hash=meta.file_hash,
+        title=title or meta.title or meta.file_name,
+        page_count=meta.page_count,
+        summary="",
+        metadata=meta.metadata,
+    )
+
+    close_db(lib)
+    print(json.dumps({
+        "registered": True,
+        "doc_id": doc_id,
+        "file_name": meta.file_name,
+        "file_type": meta.file_type,
+        "title": title or meta.title or meta.file_name,
+        "page_count": meta.page_count,
+        "file_hash": meta.file_hash[:16] + "..." if meta.file_hash else None,
+        "file_size": meta.file_size,
+    }, indent=2))
+
+
+async def cmd_read_doc(doc_id, pages=None):
+    """Read a registered document on-demand (Phase 12).
+
+    Looks up the document in the registry, reads via the appropriate
+    format handler, and returns extracted text.
+    """
+    from src.indexing.doc_readers import read_document
+
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="read-doc")
+
+    doc = lib.rolodex.get_document(doc_id)
+    if not doc:
+        close_db(lib)
+        print(json.dumps({"error": f"Document not found: {doc_id}"}))
+        sys.exit(1)
+
+    result = read_document(doc["file_path"], pages=pages)
+
+    if result.success:
+        # Update last read timestamp
+        lib.rolodex.update_document_read_time(doc_id)
+        close_db(lib)
+        print(json.dumps({
+            "doc_id": doc_id,
+            "file_name": doc["file_name"],
+            "text": result.text,
+            "metadata": result.metadata,
+            "headings": result.headings,
+        }))
+    else:
+        close_db(lib)
+        print(json.dumps({
+            "error": result.error,
+            "doc_id": doc_id,
+            "file_path": doc["file_path"],
+        }))
+        sys.exit(1)
+
+
+async def cmd_docs(subcmd, args):
+    """Document registry management (Phase 12)."""
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="docs")
+
+    if subcmd == "list":
+        docs = lib.rolodex.list_documents()
+        if not docs:
+            print(json.dumps({"documents": [], "message": "No documents registered. Use 'register-doc <path>' to add one."}))
+        else:
+            print(json.dumps({"documents": docs}, indent=2, default=str))
+
+    elif subcmd == "show":
+        if not args:
+            print(json.dumps({"error": "Usage: docs show <doc_id>"}))
+            close_db(lib)
+            sys.exit(1)
+        doc = lib.rolodex.get_document(args[0])
+        if not doc:
+            print(json.dumps({"error": f"Document not found: {args[0]}"}))
+        else:
+            # Also fetch linked entries
+            entries = lib.rolodex.get_entries_for_document(args[0])
+            doc["linked_entries"] = len(entries)
+            doc["entry_previews"] = [
+                {
+                    "id": e.id[:8],
+                    "source_location": e.source_location,
+                    "content_preview": e.content[:120],
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in entries[:10]
+            ]
+            print(json.dumps(doc, indent=2, default=str))
+
+    elif subcmd == "refresh":
+        if not args:
+            print(json.dumps({"error": "Usage: docs refresh <doc_id>"}))
+            close_db(lib)
+            sys.exit(1)
+        doc = lib.rolodex.get_document(args[0])
+        if not doc:
+            print(json.dumps({"error": f"Document not found: {args[0]}"}))
+        else:
+            from src.indexing.doc_readers import compute_file_hash
+            if not os.path.isfile(doc["file_path"]):
+                print(json.dumps({"error": f"File not found on disk: {doc['file_path']}"}))
+            else:
+                new_hash = compute_file_hash(doc["file_path"])
+                changed = new_hash != doc.get("file_hash")
+                if changed:
+                    lib.rolodex.update_document_hash(args[0], new_hash)
+                print(json.dumps({
+                    "doc_id": args[0],
+                    "changed": changed,
+                    "old_hash": (doc.get("file_hash") or "")[:16] + "...",
+                    "new_hash": new_hash[:16] + "...",
+                }))
+
+    elif subcmd == "remove":
+        if not args:
+            print(json.dumps({"error": "Usage: docs remove <doc_id>"}))
+            close_db(lib)
+            sys.exit(1)
+        existed = lib.rolodex.remove_document(args[0])
+        print(json.dumps({
+            "removed": existed,
+            "doc_id": args[0],
+            "note": "Linked entries remain but document_id cleared." if existed else "Document not found.",
+        }))
+
+    else:
+        print(json.dumps({"error": f"Unknown docs subcommand: {subcmd}. Use list|show|refresh|remove"}))
+        sys.exit(1)
+
+    close_db(lib)
+
+
+async def cmd_suggest_focus(limit=3):
+    """Suggest work streams for session-focus selection (Phase 13).
+
+    Queries project clusters (or raw topics as fallback) and returns
+    the top N most recent work streams. Designed to feed into an
+    AskUserQuestion-style prompt at session start.
+
+    Output JSON includes:
+        - suggestions: list of {project_label, topic_label, topic_id, topic_ids, last_active, entry_count}
+        - count: number of suggestions
+    """
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="suggest-focus")
+
+    from src.indexing.project_clusterer import ProjectClusterer
+    pc = ProjectClusterer(lib.rolodex.conn)
+
+    suggestions = pc.suggest_focus(limit=limit)
+
+    # Format last_active as relative time for display
+    from datetime import datetime as dt
+    now = dt.utcnow()
+    for s in suggestions:
+        if s.get("last_active"):
+            try:
+                la = dt.fromisoformat(s["last_active"])
+                delta = now - la
+                if delta.days == 0:
+                    hours = delta.seconds // 3600
+                    if hours == 0:
+                        s["last_active_relative"] = "just now"
+                    elif hours == 1:
+                        s["last_active_relative"] = "1 hour ago"
+                    else:
+                        s["last_active_relative"] = f"{hours} hours ago"
+                elif delta.days == 1:
+                    s["last_active_relative"] = "yesterday"
+                else:
+                    s["last_active_relative"] = f"{delta.days} days ago"
+            except (ValueError, TypeError):
+                s["last_active_relative"] = "unknown"
+        else:
+            s["last_active_relative"] = "unknown"
+
+    close_db(lib)
+    print(json.dumps({
+        "suggestions": suggestions,
+        "count": len(suggestions),
+    }, indent=2))
+
+
+async def cmd_focus_boot(topic_ids_json):
+    """Rebuild manifest with focus bias toward selected topic cluster (Phase 13).
+
+    Called after the user selects a focus from suggest-focus results.
+    Rebuilds the manifest with a 3x weight multiplier for entries
+    in the selected topic cluster.
+
+    Args:
+        topic_ids_json: JSON array of topic IDs to bias toward.
+    """
+    topic_ids = json.loads(topic_ids_json)
+    if not topic_ids:
+        print(json.dumps({"error": "No topic IDs provided"}))
+        sys.exit(1)
+
+    lib, mode = _make_librarian()
+    _ensure_session(lib, caller="focus-boot")
+
+    from src.retrieval.context_builder import ContextBuilder
+    from src.core.types import estimate_tokens
+    from src.storage.manifest_manager import ManifestManager
+
+    cb = ContextBuilder()
+
+    # Calculate available budget (same as boot)
+    profile = lib.rolodex.profile_get_all()
+    profile_block = cb.build_profile_block(profile) if profile else ""
+    uk_entries = lib.rolodex.get_user_knowledge_entries()
+    uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
+    fixed_cost = estimate_tokens(profile_block + uk_block)
+    available_budget = max(0, 20000 - fixed_cost)
+
+    mm = ManifestManager(lib.rolodex.conn, lib.rolodex)
+    manifest = mm.build_focused_manifest(available_budget, focus_topic_ids=topic_ids)
+
+    # Build context block from focused manifest
+    manifest_context = ""
+    if manifest and manifest.entries:
+        entry_ids = [me.entry_id for me in manifest.entries]
+        entries = lib.rolodex.get_entries_by_ids(entry_ids)
+        id_to_rank = {me.entry_id: me.slot_rank for me in manifest.entries}
+        entries.sort(key=lambda e: id_to_rank.get(e.id, 999))
+        chains = _get_gap_fill_chains(lib, manifest)
+        manifest_context = cb.build_context_block(entries, lib.session_id, chains)
+
+    close_db(lib)
+    print(json.dumps({
+        "status": "ok",
+        "boot_type": "focused",
+        "focus_topic_ids": topic_ids,
+        "manifest_entries": len(manifest.entries) if manifest else 0,
+        "total_token_cost": manifest.total_token_cost if manifest else 0,
+        "context_block": manifest_context,
+    }, indent=2))
+
+
+async def cmd_projects(subcmd, args):
+    """Project cluster management (Phase 13)."""
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="projects")
+
+    from src.indexing.project_clusterer import ProjectClusterer
+    pc = ProjectClusterer(lib.rolodex.conn)
+
+    if subcmd == "list":
+        clusters = pc._get_existing_clusters()
+        if not clusters:
+            print(json.dumps({"projects": [], "message": "No project clusters yet. They emerge from topic co-occurrence across sessions."}))
+        else:
+            formatted = []
+            for c in clusters:
+                topic_ids = json.loads(c["topic_ids"]) if isinstance(c["topic_ids"], str) else c["topic_ids"]
+                # Resolve topic labels
+                topic_labels = []
+                for tid in topic_ids:
+                    row = lib.rolodex.conn.execute("SELECT label FROM topics WHERE id = ?", (tid,)).fetchone()
+                    if row:
+                        topic_labels.append(row["label"])
+                formatted.append({
+                    "id": c["id"][:8],
+                    "full_id": c["id"],
+                    "label": c["label"],
+                    "is_user_named": bool(c["is_user_named"]),
+                    "topics": topic_labels,
+                    "topic_count": len(topic_ids),
+                    "entry_count": c["entry_count"],
+                    "session_count": c["session_count"],
+                    "last_active": c["last_active"],
+                })
+            print(json.dumps({"projects": formatted}, indent=2))
+
+    elif subcmd == "rebuild":
+        clusters = pc.rebuild_clusters()
+        print(json.dumps({
+            "rebuilt": True,
+            "cluster_count": len(clusters),
+            "clusters": [
+                {"label": c["label"], "topic_count": len(c["topic_ids"]),
+                 "entry_count": c["entry_count"]}
+                for c in clusters
+            ],
+        }, indent=2))
+
+    elif subcmd == "name":
+        if len(args) < 2:
+            print(json.dumps({"error": "Usage: projects name <cluster_id_or_prefix> <label>"}))
+            close_db(lib)
+            sys.exit(1)
+        cluster_id = args[0]
+        label = " ".join(args[1:])
+        # Try prefix match
+        row = lib.rolodex.conn.execute(
+            "SELECT id FROM project_clusters WHERE id LIKE ?",
+            (cluster_id + "%",)
+        ).fetchone()
+        if row:
+            pc.name_cluster(row["id"], label)
+            print(json.dumps({"named": True, "cluster_id": row["id"][:8], "label": label}))
+        else:
+            print(json.dumps({"error": f"Cluster not found: {cluster_id}"}))
+
+    else:
+        print(json.dumps({"error": f"Unknown projects subcommand: {subcmd}. Use list|rebuild|name"}))
+        sys.exit(1)
+
+    close_db(lib)
+
+
 async def cmd_schema():
     """Dump the database schema — table names, columns, types, and indexes.
 
@@ -1371,9 +2325,503 @@ async def cmd_history(subcmd, args):
     conn.close()
 
 
+def cmd_init(target_dir):
+    """Initialize a workspace folder for Cowork use.
+
+    Copies the Librarian source into <target>/librarian/ and generates a
+    CLAUDE.md with Cowork-compatible paths so the model can boot on first message.
+    """
+    import shutil
+    target = os.path.abspath(target_dir)
+    lib_dest = os.path.join(target, "librarian")
+
+    # 0. Clean up stale DB artifacts from any previous failed attempts
+    stale_files = ["rolodex.db", "rolodex.db-wal", "rolodex.db-journal",
+                   "rolodex.db-shm", ".cowork_session"]
+    cleaned = []
+    for sf in stale_files:
+        sf_path = os.path.join(target, sf)
+        if os.path.exists(sf_path):
+            try:
+                os.remove(sf_path)
+                cleaned.append(sf)
+            except OSError:
+                pass  # Best effort
+    # Also check inside librarian/ subfolder
+    for sf in stale_files:
+        sf_path = os.path.join(target, "librarian", sf)
+        if os.path.exists(sf_path):
+            try:
+                os.remove(sf_path)
+                cleaned.append(f"librarian/{sf}")
+            except OSError:
+                pass
+
+    # 1. Copy source (with retry for Windows file locks)
+    if os.path.exists(lib_dest):
+        import time as _time
+        for attempt in range(3):
+            try:
+                shutil.rmtree(lib_dest)
+                break
+            except PermissionError:
+                if attempt < 2:
+                    _time.sleep(2)
+                else:
+                    print(json.dumps({
+                        "error": f"Cannot remove {lib_dest} — files are locked. "
+                                 "Close any Cowork sessions using this folder, then retry."
+                    }))
+                    sys.exit(1)
+
+    os.makedirs(lib_dest, exist_ok=True)
+
+    # Determine source location: frozen (PyInstaller) vs development layout
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        # Frozen build: source files are bundled in _cowork_source/
+        cowork_src = os.path.join(meipass, "_cowork_source")
+    elif getattr(sys, 'frozen', False):
+        # Inno Setup installed layout: check next to the exe
+        exe_dir = os.path.dirname(sys.executable)
+        cowork_src = os.path.join(exe_dir, "_cowork_source")
+        if not os.path.isdir(cowork_src):
+            cowork_src = os.path.join(exe_dir, "lib", "_cowork_source")
+    else:
+        # Development layout: source is next to this script
+        cowork_src = None
+
+    if cowork_src and os.path.isdir(cowork_src):
+        # Extract from frozen bundle
+        for fname in ("librarian_cli.py", "main.py", "requirements.txt", "requirements-onnx.txt", "requirements-ml.txt"):
+            src = os.path.join(cowork_src, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(lib_dest, fname))
+        # Copy src/ tree from bundle
+        bundle_src = os.path.join(cowork_src, "src")
+        dst_src = os.path.join(lib_dest, "src")
+        if os.path.isdir(bundle_src):
+            shutil.copytree(bundle_src, dst_src, ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".pytest_cache"
+            ))
+        # Copy ONNX model if bundled
+        bundle_model = os.path.join(cowork_src, "models", "all-MiniLM-L6-v2")
+        if os.path.isdir(bundle_model):
+            dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
+            os.makedirs(dst_model, exist_ok=True)
+            for mf in ("model.onnx", "tokenizer.json"):
+                src_mf = os.path.join(bundle_model, mf)
+                if os.path.isfile(src_mf):
+                    shutil.copy2(src_mf, os.path.join(dst_model, mf))
+    else:
+        # Development layout: copy from SCRIPT_DIR
+        for fname in ("librarian_cli.py", "main.py", "requirements.txt", "requirements-onnx.txt", "requirements-ml.txt"):
+            src = os.path.join(SCRIPT_DIR, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(lib_dest, fname))
+        src_dir = os.path.join(SCRIPT_DIR, "src")
+        dst_src = os.path.join(lib_dest, "src")
+        if os.path.isdir(src_dir):
+            shutil.copytree(src_dir, dst_src, ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".pytest_cache"
+            ))
+        # Copy ONNX model from dev layout
+        dev_model = os.path.join(SCRIPT_DIR, "lib", "models", "all-MiniLM-L6-v2")
+        if os.path.isdir(dev_model):
+            dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
+            os.makedirs(dst_model, exist_ok=True)
+            for mf in ("model.onnx", "tokenizer.json"):
+                src_mf = os.path.join(dev_model, mf)
+                if os.path.isfile(src_mf):
+                    shutil.copy2(src_mf, os.path.join(dst_model, mf))
+
+    # 2. Create a pre-seeded rolodex.db with schema + welcome context
+    #    This avoids the 0-byte DB problem — the file ships as a valid SQLite DB.
+    import sqlite3
+    from datetime import datetime
+    import uuid
+
+    db_path = os.path.join(lib_dest, "rolodex.db")
+    try:
+        # Import schema from the just-copied source
+        init_src = os.path.join(lib_dest, "src")
+        _orig_path = sys.path[:]
+        sys.path.insert(0, lib_dest)
+        from src.storage.schema import SCHEMA_SQL, _safe_add_columns
+        sys.path[:] = _orig_path
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+        _safe_add_columns(conn)
+
+        # Seed a welcome user_knowledge entry so first boot has context
+        welcome_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        seed_session_id = str(uuid.uuid4())
+
+        # Create the seed session
+        conn.execute(
+            "INSERT INTO conversations (id, created_at, status, summary, last_active, message_count) "
+            "VALUES (?, ?, 'ended', 'Workspace initialized by The Librarian installer.', ?, 0)",
+            (seed_session_id, now, now)
+        )
+
+        # Seed a user_knowledge entry describing what The Librarian is
+        conn.execute(
+            "INSERT INTO rolodex_entries "
+            "(id, conversation_id, content, content_type, category, tags, source_range, "
+            " access_count, created_at, tier, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                welcome_id, seed_session_id,
+                "The Librarian is a persistent memory system for AI conversations. "
+                "It stores every exchange in a local SQLite rolodex — user preferences, "
+                "project decisions, code patterns, and past discussions survive between sessions. "
+                "Use 'remember' to store facts about yourself, 'recall' to search past context, "
+                "and 'profile set' to configure preferences like name and timezone.",
+                "prose", "user_knowledge",
+                json.dumps(["the librarian", "welcome", "getting started", "memory system"]),
+                json.dumps({}),
+                0, now, "hot",
+                json.dumps({"seeded_by": "init", "version": __version__})
+            )
+        )
+
+        # Add FTS entry
+        conn.execute(
+            "INSERT INTO rolodex_fts (entry_id, content, tags, category) VALUES (?, ?, ?, ?)",
+            (
+                welcome_id,
+                "The Librarian is a persistent memory system for AI conversations. "
+                "It stores every exchange in a local SQLite rolodex.",
+                "the librarian welcome getting started memory system",
+                "user_knowledge"
+            )
+        )
+
+        conn.commit()
+        conn.close()
+        db_seeded = True
+    except Exception as e:
+        # Non-fatal — the DB will be created at first boot instead
+        db_seeded = False
+        db_seed_error = str(e)
+
+    # 3. Derive the folder name for the wildcard path
+    folder_name = os.path.basename(target)
+
+    # 4. Generate CLAUDE.md
+    claude_md = f"""# STOP. BOOT BEFORE RESPONDING.
+
+Before generating ANY reply — even to "Hi" — run this command:
+
+```bash
+python /sessions/*/mnt/{folder_name}/librarian/librarian_cli.py boot --compact
+```
+
+The wildcard `*` resolves to whatever Cowork session slug is active. No hardcoded paths.
+
+After boot, immediately launch a background agent to load the full context:
+
+```bash
+python /sessions/*/mnt/{folder_name}/librarian/librarian_cli.py boot --full-context
+```
+
+No exceptions. No "I'll do it next message." Boot first, then respond.
+
+If prior messages in this session were not yet ingested, ingest them now before continuing.
+
+## First Boot Advisory
+
+If the boot JSON shows `total_entries` <= 1 (i.e. only the seed entry or empty), this is likely the user's first session with The Librarian. **Proactively** tell the user:
+
+"Welcome! This is your first session with The Librarian. The first boot is a bit slower while I set up the tools I need to remember our conversations — installing dependencies and initializing the memory system. Future sessions will be much faster. Just talk to me naturally and I'll start learning about you and your work."
+
+This must appear BEFORE any other output. Don't wait for the user to notice latency.
+
+## Post-Boot: Always Offer Task Options
+
+After boot, if the user's opening message does NOT specify a clear task (e.g. "Hi", "let's get to work", "hey", or any casual opener), use the AskUserQuestion tool to present task options before doing anything else. Derive the options from the `suggested_focus` clusters in the boot JSON — these represent the user's most recent active projects. Always include a catch-all "Something new" option.
+
+Do NOT just ask "what are we working on?" in plain text. Use the AskUserQuestion tool so the user gets clickable choices.
+
+## What This Is
+
+This workspace uses The Librarian, a persistent memory system by Dicta Technologies Inc. It's backed by a local SQLite rolodex that gives you continuity across conversations — user preferences, project decisions, code patterns, and past discussions survive between sessions.
+
+## How to Interact
+
+**Just have a conversation.** The Librarian works best when you talk naturally. There's nothing special you need to do — your preferences, decisions, and context are remembered automatically across sessions.
+
+Behind the scenes, the system ingests every exchange, recalls relevant past context when needed, and learns your working style over time. You don't need to manage any of this manually.
+
+## Always-On Rules
+
+- **Every message:** Verify The Librarian is booted. If unsure, boot again.
+- **Every message:** Ingest it. Both user messages and your responses, separately. See "What to Ingest" below.
+- **After compaction or continuation:** Re-boot immediately. The Librarian does not carry over.
+- **When past context would help:** Use `recall` before responding.
+- **When the user states a fact about themselves:** Use `remember` automatically. No explicit command needed from the user.
+
+## Commands (For Advanced Use)
+
+These commands are primarily used by the AI assistant behind the scenes. Users rarely need to invoke them directly — conversation is the primary interface. They're documented here for transparency and for power users who want fine-grained control.
+
+All commands use the wildcard CLI path: `python /sessions/*/mnt/{folder_name}/librarian/librarian_cli.py`
+
+- `boot` — Start or resume a session. Parse the JSON for context_block, user_profile, and bridge_summary.
+- `ingest user "message"` / `ingest assistant "message"` — Save content. Supports flags: `--user-knowledge` (privileged tier), `--corrects <entry_id>` (supersede a wrong entry).
+- `remember "fact"` — Store a fact about the user as user_knowledge. Always loaded at boot, 3x search boost, never demoted. Use for preferences, biographical details, corrections, working style.
+- `recall "topic"` — Retrieve relevant past context.
+- `correct <old_entry_id> "corrected text"` — Replace a factually wrong entry. Use for error corrections, NOT for reasoning chains where the evolution matters.
+- `profile set <key> <value>` — Set a user preference (name, timezone, response_style, etc.).
+- `profile show` — View all stored user preferences.
+- `profile delete <key>` — Remove a user preference.
+- `end "summary"` — Close a session with a one-line summary.
+- `window` — Check context budget.
+- `stats` — View memory system health.
+
+## What to Ingest
+
+**Everything. 100% coverage. No cherry-picking.**
+
+Ingest every user message and every assistant response, verbatim. Storage is trivial for a local hard drive. Lossy ingestion is worse than a large corpus — the search layer (user_knowledge boost, categories, ranking) handles surfacing the right things. Cherry-picking at ingestion time loses context that may matter later.
+
+Skip only bare acknowledgments with zero informational content ("ok", "thanks", "got it").
+
+## What to Recall
+
+Anything where past context helps: references to previous sessions, projects, people, terms, or whenever you feel you *should* know something but don't.
+
+## Entry Hierarchy
+
+1. **User Profile** — key-value pairs (name, timezone, response_style). Loaded first at boot.
+2. **User Knowledge** — rich facts about the user (preferences, corrections, biographical context). Always loaded at boot, 3x search boost, permanently hot. Created via `remember` or `ingest --user-knowledge`.
+3. **Regular entries** — everything else. Searched on demand via `recall`.
+
+## Browse Command — Always Display In-Chat
+
+When running `browse` (or any subcommand), the output may land in a collapsed tool-output panel that the user cannot easily see. **Always echo browse results directly into the chat response.** Use the `--json` flag to get structured output, then format it as a readable code block or inline text in your reply.
+
+```bash
+python /sessions/*/mnt/{folder_name}/librarian/librarian_cli.py browse recent 5 --json
+```
+
+Then include the formatted results in your message so the user sees them without expanding any dropdown.
+
+## Corrections vs. Reasoning Chains
+
+When the user corrects a factual error (e.g. wrong name), use `correct` or `--corrects` to supersede the old entry. The old entry is soft-deleted (hidden from search, kept in DB).
+
+When the user changes their mind on a design decision (e.g. renaming a tool), do NOT supersede. Both entries should remain — the reasoning chain ("we considered X, then pivoted to Y because Z") is valuable context.
+"""
+
+    claude_md_path = os.path.join(target, "CLAUDE.md")
+    with open(claude_md_path, "w", encoding="utf-8") as f:
+        f.write(claude_md.strip() + "\n")
+
+    files_created = ["CLAUDE.md", "librarian/librarian_cli.py", "librarian/main.py",
+                      "librarian/requirements.txt", "librarian/src/"]
+    if db_seeded:
+        files_created.append("librarian/rolodex.db")
+
+    result = {
+        "status": "ok",
+        "initialized": target,
+        "folder_name": folder_name,
+        "files_created": files_created,
+        "db_seeded": db_seeded,
+        "stale_files_cleaned": cleaned if cleaned else [],
+        "next_steps": [
+            f"Open Cowork and select '{target}' as your folder",
+            "Send any message — The Librarian will boot automatically",
+        ]
+    }
+    if not db_seeded:
+        result["db_seed_error"] = db_seed_error
+    print(json.dumps(result, indent=2))
+
+
+# ─── GUI Installer (tkinter) ──────────────────────────────────────────
+
+def cmd_install_gui():
+    """Launch a zero-friction GUI installer using tkinter.
+
+    This runs when the user double-clicks librarian.exe with no arguments.
+    Shows a simple window: title → folder picker → Install → success message.
+    No external tools (Inno Setup, NSIS, etc.) required.
+    """
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    default_workspace = os.path.join(os.path.expanduser("~"), "Documents", "My Librarian")
+
+    root = tk.Tk()
+    root.title("The Librarian — Setup")
+    root.geometry("520x380")
+    root.resizable(False, False)
+
+    # Center on screen
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - 520) // 2
+    y = (root.winfo_screenheight() - 380) // 2
+    root.geometry(f"+{x}+{y}")
+
+    # Try to set a neutral background
+    bg = "#f5f5f5"
+    root.configure(bg=bg)
+
+    # ── Title ──
+    tk.Label(root, text="The Librarian", font=("Segoe UI", 20, "bold"),
+             bg=bg).pack(pady=(25, 2))
+    tk.Label(root, text="Persistent Memory for AI Conversations",
+             font=("Segoe UI", 10), fg="#666", bg=bg).pack(pady=(0, 20))
+
+    # ── Workspace selection ──
+    tk.Label(root, text="Choose your workspace folder:", font=("Segoe UI", 10),
+             bg=bg, anchor="w").pack(anchor="w", padx=35)
+
+    picker_frame = tk.Frame(root, bg=bg)
+    picker_frame.pack(fill="x", padx=35, pady=(5, 0))
+
+    path_var = tk.StringVar(value=default_workspace)
+    entry = tk.Entry(picker_frame, textvariable=path_var, font=("Segoe UI", 9))
+    entry.pack(side="left", fill="x", expand=True)
+
+    def browse():
+        initial = path_var.get().strip()
+        if not os.path.isdir(initial):
+            initial = os.path.expanduser("~")
+        chosen = filedialog.askdirectory(initialdir=initial, title="Select Workspace Folder")
+        if chosen:
+            path_var.set(chosen)
+
+    tk.Button(picker_frame, text="Browse...", command=browse,
+              font=("Segoe UI", 9)).pack(side="right", padx=(8, 0))
+
+    tk.Label(root, text="This is the folder you'll select in Cowork or Claude Code.\n"
+                        "The default works great for most people.",
+             font=("Segoe UI", 8), fg="#888", bg=bg).pack(pady=(4, 15))
+
+    # ── Status label ──
+    status_var = tk.StringVar(value="")
+    status_label = tk.Label(root, textvariable=status_var, font=("Segoe UI", 9),
+                            fg="#0066cc", bg=bg)
+    status_label.pack(pady=(0, 5))
+
+    # ── Install action ──
+    def do_install():
+        target = path_var.get().strip()
+        if not target:
+            messagebox.showerror("Error", "Please choose a workspace folder.")
+            return
+
+        install_btn.config(state="disabled", text="Setting up...")
+        status_var.set("Initializing your workspace...")
+        root.update()
+
+        try:
+            # Ensure the target directory exists
+            os.makedirs(target, exist_ok=True)
+            cmd_init(target)
+
+            # Optional: self-install to AppData + PATH (best-effort, non-blocking)
+            _self_install_to_path()
+
+            status_var.set("")
+            messagebox.showinfo(
+                "You're All Set!",
+                f"Your workspace is ready at:\n{target}\n\n"
+                "To get started:\n"
+                "1. Open Cowork (in the Claude desktop app)\n"
+                "2. Click 'Select folder'\n"
+                "3. Navigate to your workspace folder\n"
+                "4. Send any message \u2014 The Librarian will introduce itself\n\n"
+                "That's it. The Librarian remembers everything from here on out."
+            )
+            root.destroy()
+        except Exception as e:
+            status_var.set("")
+            install_btn.config(state="normal", text="Install")
+            messagebox.showerror("Setup Failed", f"Something went wrong:\n{e}")
+
+    install_btn = tk.Button(root, text="Install", command=do_install,
+                            font=("Segoe UI", 12, "bold"), width=18,
+                            relief="flat", bg="#0066cc", fg="white",
+                            activebackground="#004999", activeforeground="white",
+                            cursor="hand2")
+    install_btn.pack(pady=(5, 15))
+
+    # ── Footer ──
+    tk.Label(root, text=f"v{__version__}  \u2022  Dicta Technologies Inc.",
+             font=("Segoe UI", 8), fg="#aaa", bg=bg).pack(side="bottom", pady=8)
+
+    root.mainloop()
+
+
+def _self_install_to_path():
+    """Best-effort: copy the frozen exe to AppData and add to user PATH.
+
+    This is a bonus for CLI/Claude Code users. If it fails, the workspace
+    is still fully functional for Cowork — so failures are silently ignored.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # Only relevant for frozen builds
+    if sys.platform != "win32":
+        return
+
+    try:
+        import shutil
+
+        src_exe = sys.executable
+        src_dir = os.path.dirname(src_exe)
+
+        # Install to %LOCALAPPDATA%\The Librarian
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if not local_app_data:
+            return
+
+        install_dir = os.path.join(local_app_data, "The Librarian")
+        bin_dir = os.path.join(install_dir, "bin")
+        lib_dir = os.path.join(install_dir, "lib")
+
+        os.makedirs(bin_dir, exist_ok=True)
+
+        # Copy the entire frozen bundle to lib/
+        if os.path.abspath(src_dir) != os.path.abspath(lib_dir):
+            if os.path.exists(lib_dir):
+                shutil.rmtree(lib_dir, ignore_errors=True)
+            shutil.copytree(src_dir, lib_dir)
+
+        # Copy exe to bin/ for clean PATH entry
+        shutil.copy2(os.path.join(lib_dir, "librarian.exe"),
+                      os.path.join(bin_dir, "librarian.exe"))
+
+        # Add bin/ to user PATH via registry
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_ALL_ACCESS) as key:
+            try:
+                current_path, _ = winreg.QueryValueEx(key, "Path")
+            except OSError:
+                current_path = ""
+            if bin_dir.lower() not in current_path.lower():
+                new_path = current_path.rstrip(";") + ";" + bin_dir
+                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
+    except Exception:
+        pass  # Best-effort — Cowork doesn't need this
+
+
 async def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|stats|end|topics|window|schema|history> [args]"}))
+        # No arguments: launch GUI installer if frozen, else show usage
+        if getattr(sys, 'frozen', False):
+            cmd_install_gui()
+            return
+        print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|stats|end|topics|window|schema|history|init> [args]"}))
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
@@ -1397,6 +2845,8 @@ async def main():
             as_user_knowledge = False
             corrects_id = None
             is_summary = False
+            doc_id = None
+            source_location = None
             remaining = sys.argv[4:]
             i = 0
             while i < len(remaining):
@@ -1407,8 +2857,15 @@ async def main():
                 elif remaining[i] == "--corrects" and i + 1 < len(remaining):
                     i += 1
                     corrects_id = remaining[i]
+                elif remaining[i] == "--doc" and i + 1 < len(remaining):
+                    i += 1
+                    doc_id = remaining[i]
+                elif remaining[i] == "--loc" and i + 1 < len(remaining):
+                    i += 1
+                    source_location = remaining[i]
                 i += 1
-            await cmd_ingest(role, content, corrects_id=corrects_id, as_user_knowledge=as_user_knowledge, is_summary=is_summary)
+            await cmd_ingest(role, content, corrects_id=corrects_id, as_user_knowledge=as_user_knowledge,
+                             is_summary=is_summary, doc_id=doc_id, source_location=source_location)
 
         elif cmd == "batch-ingest":
             if len(sys.argv) < 3:
@@ -1418,9 +2875,18 @@ async def main():
 
         elif cmd == "recall":
             if len(sys.argv) < 3:
-                print(json.dumps({"error": "Usage: librarian_cli.py recall \"<query>\""}))
+                print(json.dumps({"error": "Usage: librarian_cli.py recall \"<query>\" [--source conversation|document]"}))
                 sys.exit(1)
-            await cmd_recall(sys.argv[2])
+            recall_query = sys.argv[2]
+            recall_source = None
+            remaining = sys.argv[3:]
+            ri = 0
+            while ri < len(remaining):
+                if remaining[ri] == "--source" and ri + 1 < len(remaining):
+                    ri += 1
+                    recall_source = remaining[ri]
+                ri += 1
+            await cmd_recall(recall_query, source_type=recall_source)
 
         elif cmd == "stats":
             await cmd_stats()
@@ -1463,10 +2929,79 @@ async def main():
             args = sys.argv[3:] if len(sys.argv) > 3 else []
             await cmd_profile(subcmd, args)
 
+        elif cmd == "browse":
+            subcmd = sys.argv[2].lower() if len(sys.argv) > 2 else "recent"
+            raw_args = sys.argv[3:] if len(sys.argv) > 3 else []
+            browse_json = "--json" in raw_args
+            browse_args = [a for a in raw_args if a != "--json"]
+            await cmd_browse(subcmd, browse_args, as_json=browse_json)
+
+        elif cmd == "register-doc":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py register-doc \"<file_path>\" [--title \"...\"]"}))
+                sys.exit(1)
+            reg_path = sys.argv[2]
+            reg_title = None
+            remaining = sys.argv[3:]
+            ri = 0
+            while ri < len(remaining):
+                if remaining[ri] == "--title" and ri + 1 < len(remaining):
+                    ri += 1
+                    reg_title = remaining[ri]
+                ri += 1
+            await cmd_register_doc(reg_path, title=reg_title)
+
+        elif cmd == "read-doc":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py read-doc <doc_id> [--pages \"1-5\"]"}))
+                sys.exit(1)
+            rd_id = sys.argv[2]
+            rd_pages = None
+            remaining = sys.argv[3:]
+            ri = 0
+            while ri < len(remaining):
+                if remaining[ri] == "--pages" and ri + 1 < len(remaining):
+                    ri += 1
+                    rd_pages = remaining[ri]
+                ri += 1
+            await cmd_read_doc(rd_id, pages=rd_pages)
+
+        elif cmd == "docs":
+            subcmd = sys.argv[2].lower() if len(sys.argv) > 2 else "list"
+            args = sys.argv[3:] if len(sys.argv) > 3 else []
+            await cmd_docs(subcmd, args)
+
         elif cmd == "manifest":
             subcmd = sys.argv[2].lower() if len(sys.argv) > 2 else "stats"
             args = sys.argv[3:] if len(sys.argv) > 3 else []
             await cmd_manifest(subcmd, args)
+
+        elif cmd == "suggest-focus":
+            limit = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+            await cmd_suggest_focus(limit=limit)
+
+        elif cmd == "focus-boot":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py focus-boot '<json_array_of_topic_ids>'"}))
+                sys.exit(1)
+            await cmd_focus_boot(sys.argv[2])
+
+        elif cmd == "projects":
+            subcmd = sys.argv[2].lower() if len(sys.argv) > 2 else "list"
+            args = sys.argv[3:] if len(sys.argv) > 3 else []
+            await cmd_projects(subcmd, args)
+
+        elif cmd == "init":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py init <target_folder>"}))
+                sys.exit(1)
+            cmd_init(sys.argv[2])
+            return
+
+        elif cmd == "install":
+            # Explicit install command — launches the GUI
+            cmd_install_gui()
+            return
 
         elif cmd == "schema":
             await cmd_schema()
@@ -1477,7 +3012,7 @@ async def main():
             await cmd_history(subcmd, args)
 
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|retag|stats|end|topics|window|manifest|schema|history"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects"}))
             sys.exit(1)
 
     except Exception as e:

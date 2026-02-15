@@ -1,6 +1,20 @@
+"""
+The Librarian — Context Negotiator (Phase 6c)
 
+Haiku-mediated dialogue for surgical context injection.
+Instead of dumping all retrieved entries into the prompt,
+the negotiator evaluates which entries actually address the gap,
+respects the token budget, and optionally refines the search.
 
+Protocol:
+1. Working Agent signals a gap (topic extracted)
+2. Librarian retrieves candidate entries with relevance scores
+3. Negotiator (Haiku) evaluates: accept/reject/refine
+4. Only accepted entries get injected
+5. Outcome feeds back into pressure monitor
 
+Uses Haiku for all negotiation turns — never Sonnet/Opus.
+"""
 import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -10,24 +24,24 @@ from .types import RolodexEntry, estimate_tokens
 
 @dataclass
 class NegotiationRound:
-
+    """Record of one negotiation round."""
     entries_evaluated: int
-    accepted: List[str]
-    rejected: List[str]
-    budget_after: int
+    accepted: List[str]     # entry IDs
+    rejected: List[str]     # entry IDs
+    budget_after: int       # remaining token budget
     refined_query: Optional[str] = None
 
 
 @dataclass
 class NegotiationResult:
-
+    """Final outcome of a negotiation."""
     accepted_entries: List[RolodexEntry]
     rejected_ids: List[str]
     rounds: List[NegotiationRound]
     budget_used: int
     budget_remaining: int
     total_rounds: int
-    resolved: bool
+    resolved: bool          # Did we find useful context?
 
 
 NEGOTIATION_PROMPT = """You are The Librarian's context negotiator. Your job is to decide which memory entries
@@ -61,7 +75,12 @@ Respond with ONLY valid JSON:
 
 
 class ContextNegotiator:
+    """
+    Haiku-mediated dialogue for surgical context injection.
 
+    Evaluates retrieved entries against the gap topic, respects token budget,
+    and optionally refines the search for a second round.
+    """
 
     def __init__(
         self,
@@ -70,8 +89,13 @@ class ContextNegotiator:
         max_rounds: int = 2,
         cost_tracker=None,
     ):
-
-
+        """
+        Args:
+            api_key: Anthropic API key
+            model: Model for negotiation (default Haiku — cheap + fast)
+            max_rounds: Maximum negotiation rounds before accepting top entries
+            cost_tracker: Optional CostTracker for recording API costs
+        """
         self._api_key = api_key
         self.model = model
         self.max_rounds = max_rounds
@@ -79,7 +103,7 @@ class ContextNegotiator:
         self._client = None
 
     def _get_client(self):
-
+        """Lazy-init Anthropic client."""
         if self._client is None:
             import anthropic
             self._client = anthropic.Anthropic(api_key=self._api_key)
@@ -94,8 +118,21 @@ class ContextNegotiator:
         search_fn=None,
         candidate_chains=None,
     ) -> NegotiationResult:
+        """
+        Run the negotiation protocol.
 
+        Args:
+            gap_topic: What the Working Agent needs context about
+            candidate_entries: Retrieved entries to evaluate
+            relevance_scores: Dict of entry_id → relevance score (0-1)
+            budget_tokens: Maximum tokens available for context injection
+            search_fn: Optional async function for refined search (round 2)
+            candidate_chains: Optional list of ReasoningChain objects providing
+                              narrative context for the negotiation (Phase 7)
 
+        Returns:
+            NegotiationResult with accepted entries and metadata
+        """
         if not candidate_entries:
             return NegotiationResult(
                 accepted_entries=[],
@@ -115,13 +152,13 @@ class ContextNegotiator:
         all_rejected_ids: List[str] = []
 
         for round_num in range(self.max_rounds):
-
+            # Evaluate candidates (chains only provided on first round)
             evaluation = await self._evaluate_candidates(
                 gap_topic, current_entries, current_scores, remaining_budget,
                 chains=candidate_chains if round_num == 0 else None,
             )
 
-
+            # Parse decisions
             accepted_ids = set()
             rejected_ids = set()
             for decision in evaluation.get("decisions", []):
@@ -132,17 +169,17 @@ class ContextNegotiator:
                 else:
                     rejected_ids.add(eid)
 
-
+            # Compute budget impact
             round_accepted = []
             round_budget_used = 0
             for entry in current_entries:
                 if entry.id in accepted_ids:
-                    entry_tokens = estimate_tokens(entry.content) + 20
+                    entry_tokens = estimate_tokens(entry.content) + 20  # overhead
                     if round_budget_used + entry_tokens <= remaining_budget:
                         round_accepted.append(entry)
                         round_budget_used += entry_tokens
                     else:
-                        rejected_ids.add(entry.id)
+                        rejected_ids.add(entry.id)  # Budget exceeded
 
             remaining_budget -= round_budget_used
             all_accepted.extend(round_accepted)
@@ -159,14 +196,14 @@ class ContextNegotiator:
                 refined_query=refined_query,
             ))
 
-
+            # If confident or no refinement possible, we're done
             if confidence >= 0.7 or not refined_query or not search_fn:
                 break
 
-
+            # Round 2: refined search
             if round_num < self.max_rounds - 1 and refined_query and search_fn:
                 new_entries, new_scores = await search_fn(refined_query)
-
+                # Filter out entries we already evaluated
                 seen_ids = {e.id for e in candidate_entries}
                 current_entries = [e for e in new_entries if e.id not in seen_ids]
                 current_scores = {
@@ -174,7 +211,7 @@ class ContextNegotiator:
                     if eid not in seen_ids
                 }
                 if not current_entries:
-                    break
+                    break  # No new entries to evaluate
 
         total_budget_used = budget_tokens - remaining_budget
         return NegotiationResult(
@@ -195,11 +232,19 @@ class ContextNegotiator:
         budget: int,
         chains=None,
     ) -> Dict:
+        """
+        Single Haiku call: evaluate entries against the gap.
 
+        Returns dict with decisions, refined_query, confidence.
+        Falls back to score-based heuristic if API call fails.
 
+        Phase 7: When chains are provided, they give Haiku narrative
+        context ("why" something happened) alongside discrete candidates.
+        """
+        # Build entries block for the prompt
         entries_block = self._format_entries_for_prompt(entries, scores)
 
-
+        # Phase 7: Format chains as narrative context for the negotiator
         chain_context = ""
         if chains:
             chain_lines = [
@@ -232,7 +277,7 @@ class ContextNegotiator:
                 messages=[{"role": "user", "content": prompt}],
             )
 
-
+            # Track cost
             if self.cost_tracker and hasattr(response, "usage"):
                 self.cost_tracker.record(
                     call_type="negotiation",
@@ -242,7 +287,7 @@ class ContextNegotiator:
                 )
 
             text = response.content[0].text.strip()
-
+            # Handle ```json wrapping
             if text.startswith("```"):
                 text = text.split("\n", 1)[1] if "\n" in text else text[3:]
                 if text.endswith("```"):
@@ -252,7 +297,7 @@ class ContextNegotiator:
             return json.loads(text)
 
         except Exception:
-
+            # Fallback: accept entries above score threshold, reject below
             return self._heuristic_evaluation(entries, scores, budget)
 
     def _heuristic_evaluation(
@@ -261,8 +306,10 @@ class ContextNegotiator:
         scores: Dict[str, float],
         budget: int,
     ) -> Dict:
-
-
+        """
+        Score-based fallback when Haiku is unavailable.
+        Accept entries with relevance >= 0.5, reject below.
+        """
         decisions = []
         for entry in entries:
             score = scores.get(entry.id, 0.0)
@@ -283,7 +330,7 @@ class ContextNegotiator:
         entries: List[RolodexEntry],
         scores: Dict[str, float],
     ) -> str:
-
+        """Format entries for the negotiation prompt."""
         lines = []
         for i, entry in enumerate(entries):
             score = scores.get(entry.id, 0.0)

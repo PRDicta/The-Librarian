@@ -1,0 +1,11 @@
+# The Librarian — ONNX Embedding Dependencies (Lightweight)
+# Enables real semantic embeddings via ONNX Runtime (~49 MB, often pre-installed)
+# + tokenizers (~5 MB) for text tokenization. Total: ~55 MB vs ~2 GB for PyTorch.
+
+-r requirements.txt
+
+# ONNX inference (may already be pre-installed on Cowork VMs)
+onnxruntime>=1.14.0
+
+# Fast tokenizer (Rust-backed, needed to tokenize text for the ONNX model)
+tokenizers>=0.13.0

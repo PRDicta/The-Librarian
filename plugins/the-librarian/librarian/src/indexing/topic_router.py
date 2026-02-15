@@ -1,6 +1,16 @@
+"""
+The Librarian — Topic Router (Phase 8)
 
+Detects and assigns topics to entries. Topics emerge organically from
+content — no manual curation needed. Uses three inference strategies:
 
+1. Tag aggregation: entry tags → match existing topic labels
+2. Embedding clustering: cosine similarity to topic embeddings
+3. Fallback creation: if no match, create a new topic from tags
 
+Topics are stored in the DB with their own embeddings for efficient
+query-time routing.
+"""
 import json
 import uuid
 from typing import List, Optional, Dict, Tuple
@@ -12,7 +22,10 @@ from ..storage.schema import serialize_embedding, deserialize_embedding
 
 
 class TopicRouter:
-
+    """
+    Routes entries to emergent topics.
+    Topics are created on-the-fly as new clusters of knowledge emerge.
+    """
 
     def __init__(
         self,
@@ -22,41 +35,55 @@ class TopicRouter:
         merge_threshold: float = 0.85,
         min_tags_for_topic: int = 2,
     ):
-
-
+        """
+        Args:
+            conn: SQLite connection (shared with Rolodex)
+            embedding_manager: EmbeddingManager instance for computing similarities
+            confidence_threshold: Min confidence to assign a topic (0-1)
+            merge_threshold: Similarity above which two topics auto-merge
+            min_tags_for_topic: Minimum meaningful tags before creating a topic
+        """
         self.conn = conn
         self.embeddings = embedding_manager
         self.confidence_threshold = confidence_threshold
         self.merge_threshold = merge_threshold
         self.min_tags_for_topic = min_tags_for_topic
 
-
+        # In-memory cache of topic embeddings for fast clustering
         self._topic_cache: Dict[str, Dict] = {}
         self._cache_loaded = False
 
+    # ─── Topic Inference ─────────────────────────────────────────────────
 
     async def infer_topic(
         self,
         entry: RolodexEntry,
     ) -> Optional[str]:
+        """
+        Infer the primary topic for an entry.
+        Returns topic_id if a match is found or created, None otherwise.
 
-
+        Strategy order:
+        1. Tag-based: match entry tags against existing topic labels
+        2. Embedding-based: cluster by similarity to topic embeddings
+        3. Fallback: create new topic from entry tags if enough signal
+        """
         self._ensure_cache_loaded()
 
-
+        # Strategy 1: Tag-based inference
         topic_id = self._infer_from_tags(entry)
         if topic_id:
             self._record_assignment(entry.id, topic_id, 0.8, "tag_inference")
             return topic_id
 
-
+        # Strategy 2: Embedding-based clustering
         if entry.embedding:
             topic_id, confidence = self._cluster_by_embedding(entry)
             if topic_id and confidence >= self.confidence_threshold:
                 self._record_assignment(entry.id, topic_id, confidence, "embedding_clustering")
                 return topic_id
 
-
+        # Strategy 3: Create new topic from tags
         meaningful_tags = [
             t for t in entry.tags
             if t not in ("pending-enrichment", "prose", "code", "conversational")
@@ -76,14 +103,18 @@ class TopicRouter:
         self,
         query: LibrarianQuery,
     ) -> Optional[str]:
-
-
+        """
+        Infer which topic a query is most relevant to.
+        Used at search time to scope results to the right namespace.
+        If the matched topic is a parent, returns the parent ID
+        (use get_topic_group() to expand to children).
+        """
         self._ensure_cache_loaded()
 
         if not self._topic_cache:
             return None
 
-
+        # Try keyword match first — prefer parent topics for broader recall
         query_lower = query.query_text.lower()
         best_keyword_match = None
         best_keyword_is_parent = False
@@ -91,17 +122,17 @@ class TopicRouter:
             label_lower = topic_data["label"].lower()
             if label_lower in query_lower or query_lower in label_lower:
                 is_parent = topic_data.get("is_parent", False)
-
+                # Prefer parent matches over child matches
                 if is_parent or not best_keyword_match:
                     best_keyword_match = topic_id
                     best_keyword_is_parent = is_parent
                     if is_parent:
-                        break
+                        break  # Parent match is ideal, stop looking
 
         if best_keyword_match:
             return best_keyword_match
 
-
+        # Try embedding similarity
         if hasattr(query, 'query_embedding') and getattr(query, 'query_embedding', None):
             query_emb = query.query_embedding
         elif self.embeddings:
@@ -124,20 +155,24 @@ class TopicRouter:
         return None
 
     def get_topic_group(self, topic_id: str) -> List[str]:
-
-
+        """
+        Given a topic ID, return all topic IDs in its group.
+        If it's a parent: returns [parent_id] + all child IDs.
+        If it's a child: returns [parent_id] + all sibling IDs.
+        If it's standalone: returns [topic_id].
+        """
         self._ensure_cache_loaded()
 
         topic_data = self._topic_cache.get(topic_id)
         if not topic_data:
             return [topic_id]
 
-
+        # Check if this is a parent (has children)
         children = self._get_children(topic_id)
         if children:
             return [topic_id] + children
 
-
+        # Check if this is a child (has a parent)
         parent_id = topic_data.get("parent_topic_id")
         if parent_id:
             siblings = self._get_children(parent_id)
@@ -146,13 +181,14 @@ class TopicRouter:
         return [topic_id]
 
     def _get_children(self, parent_id: str) -> List[str]:
-
+        """Get all child topic IDs for a parent."""
         rows = self.conn.execute(
             "SELECT id FROM topics WHERE parent_topic_id = ?",
             (parent_id,)
         ).fetchall()
         return [row["id"] for row in rows]
 
+    # ─── Topic CRUD ──────────────────────────────────────────────────────
 
     async def create_topic(
         self,
@@ -160,12 +196,14 @@ class TopicRouter:
         description: str = "",
         seed_entries: Optional[List[RolodexEntry]] = None,
     ) -> str:
-
-
+        """
+        Create a new topic. Computes topic embedding from seed entries
+        if provided. Returns topic_id.
+        """
         topic_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
 
-
+        # Compute topic embedding from seed entries
         embedding_blob = None
         embedding_list = None
         if seed_entries and self.embeddings:
@@ -174,7 +212,7 @@ class TopicRouter:
                 if e.embedding
             ]
             if entry_embeddings:
-
+                # Average the embeddings
                 avg = np.mean(entry_embeddings, axis=0)
                 norm = np.linalg.norm(avg)
                 if norm > 0:
@@ -197,7 +235,7 @@ class TopicRouter:
         )
         self.conn.commit()
 
-
+        # Update cache
         self._topic_cache[topic_id] = {
             "label": label,
             "description": description,
@@ -208,7 +246,7 @@ class TopicRouter:
         return topic_id
 
     def list_topics(self, limit: int = 50, min_entries: int = 0) -> List[Dict]:
-
+        """List all topics with metadata."""
         sql = "SELECT * FROM topics"
         params = []
         if min_entries > 0:
@@ -232,7 +270,7 @@ class TopicRouter:
         ]
 
     def get_topic(self, topic_id: str) -> Optional[Dict]:
-
+        """Fetch a single topic by ID."""
         row = self.conn.execute(
             "SELECT * FROM topics WHERE id = ?", (topic_id,)
         ).fetchone()
@@ -249,7 +287,7 @@ class TopicRouter:
         }
 
     def get_entries_for_topic(self, topic_id: str, limit: int = 50) -> List[str]:
-
+        """Get entry IDs assigned to a topic."""
         rows = self.conn.execute(
             """SELECT entry_id FROM topic_assignments
                WHERE topic_id = ?
@@ -259,19 +297,23 @@ class TopicRouter:
         return [row["entry_id"] for row in rows]
 
     def count_topics(self) -> int:
-
+        """Count total topics."""
         return self.conn.execute("SELECT COUNT(*) as cnt FROM topics").fetchone()["cnt"]
 
     def count_unassigned_entries(self) -> int:
-
+        """Count entries without a topic assignment."""
         return self.conn.execute(
             """SELECT COUNT(*) as cnt FROM rolodex_entries
                WHERE topic_id IS NULL"""
         ).fetchone()["cnt"]
 
     def merge_topics(self, source_id: str, target_id: str) -> int:
-
-
+        """
+        Merge source topic into target. Reassigns all entries,
+        sets parent_topic_id on source, updates counts.
+        Returns number of entries reassigned.
+        """
+        # Reassign entries
         self.conn.execute(
             "UPDATE rolodex_entries SET topic_id = ? WHERE topic_id = ?",
             (target_id, source_id)
@@ -280,12 +322,12 @@ class TopicRouter:
             "UPDATE topic_assignments SET topic_id = ? WHERE topic_id = ?",
             (target_id, source_id)
         )
-
+        # Update source topic parent
         self.conn.execute(
             "UPDATE topics SET parent_topic_id = ? WHERE id = ?",
             (target_id, source_id)
         )
-
+        # Recalculate target entry count
         count = self.conn.execute(
             "SELECT COUNT(*) as cnt FROM topic_assignments WHERE topic_id = ?",
             (target_id,)
@@ -296,13 +338,14 @@ class TopicRouter:
         )
         self.conn.commit()
 
-
+        # Refresh cache
         self._cache_loaded = False
         return count
 
+    # ─── Internal Strategies ─────────────────────────────────────────────
 
     def _infer_from_tags(self, entry: RolodexEntry) -> Optional[str]:
-
+        """Match entry tags against existing topic labels."""
         if not entry.tags or not self._topic_cache:
             return None
 
@@ -318,7 +361,7 @@ class TopicRouter:
                 best_overlap = overlap
                 best_match = topic_id
 
-
+        # Require at least 1 tag overlap
         if best_overlap >= 1:
             return best_match
 
@@ -327,7 +370,7 @@ class TopicRouter:
     def _cluster_by_embedding(
         self, entry: RolodexEntry
     ) -> Tuple[Optional[str], float]:
-
+        """Find closest topic by embedding similarity."""
         if not entry.embedding or not self._topic_cache:
             return None, 0.0
 
@@ -346,24 +389,25 @@ class TopicRouter:
     async def _create_topic_from_tags(
         self, tags: List[str], entry: RolodexEntry
     ) -> Optional[str]:
+        """Create a new topic from an entry's tags."""
+        # Build label from most descriptive tags
+        label = " ".join(sorted(tags[:4]))  # Cap at 4 tags for label
 
-
-        label = " ".join(sorted(tags[:4]))
-
-
+        # Check if similar topic already exists
         existing = self.conn.execute(
             "SELECT id FROM topics WHERE label = ?", (label,)
         ).fetchone()
         if existing:
             return existing["id"]
 
-
+        # Create new topic with this entry as seed
         return await self.create_topic(
             label=label,
             description=f"Auto-created from entry tags: {', '.join(tags)}",
             seed_entries=[entry] if entry.embedding else None,
         )
 
+    # ─── Assignment Recording ────────────────────────────────────────────
 
     def _record_assignment(
         self,
@@ -372,10 +416,10 @@ class TopicRouter:
         confidence: float,
         source: str,
     ) -> None:
-
+        """Record a topic assignment and update entry's topic_id."""
         now = datetime.utcnow().isoformat()
 
-
+        # Record in assignment log
         self.conn.execute(
             """INSERT INTO topic_assignments
                (id, entry_id, topic_id, confidence, source, assigned_at)
@@ -383,13 +427,13 @@ class TopicRouter:
             (str(uuid.uuid4()), entry_id, topic_id, confidence, source, now)
         )
 
-
+        # Update entry's topic_id
         self.conn.execute(
             "UPDATE rolodex_entries SET topic_id = ? WHERE id = ?",
             (topic_id, entry_id)
         )
 
-
+        # Increment topic entry count
         self.conn.execute(
             """UPDATE topics SET entry_count = entry_count + 1,
                last_updated = ? WHERE id = ?""",
@@ -397,14 +441,15 @@ class TopicRouter:
         )
         self.conn.commit()
 
-
+        # Update cache
         if topic_id in self._topic_cache:
             self._topic_cache[topic_id]["entry_count"] = \
                 self._topic_cache[topic_id].get("entry_count", 0) + 1
 
+    # ─── Cache Management ────────────────────────────────────────────────
 
     def _ensure_cache_loaded(self) -> None:
-
+        """Lazy-load topic cache from DB."""
         if self._cache_loaded:
             return
 
@@ -413,7 +458,7 @@ class TopicRouter:
             "SELECT * FROM topics"
         ).fetchall()
 
-
+        # Collect parent IDs for is_parent detection
         parent_ids = set()
         for row in rows:
             if row["parent_topic_id"]:
@@ -435,13 +480,14 @@ class TopicRouter:
         self._cache_loaded = True
 
     def invalidate_cache(self) -> None:
-
+        """Force cache reload on next access."""
         self._cache_loaded = False
 
+    # ─── Utilities ───────────────────────────────────────────────────────
 
     @staticmethod
     def _cosine_sim(a: List[float], b: List[float]) -> float:
-
+        """Cosine similarity between two vectors."""
         a_arr = np.array(a, dtype=np.float32)
         b_arr = np.array(b, dtype=np.float32)
         dot = np.dot(a_arr, b_arr)

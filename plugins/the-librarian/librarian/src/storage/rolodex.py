@@ -192,7 +192,8 @@ class Rolodex:
             return deserialize_entry(row)
         return None
     def keyword_search(
-        self, query: str, limit: int = 5, conversation_id: Optional[str] = None
+        self, query: str, limit: int = 5, conversation_id: Optional[str] = None,
+        source_type: Optional[str] = None,
     ) -> List[Tuple[RolodexEntry, float]]:
         """
         Full-text search via FTS5.
@@ -200,9 +201,11 @@ class Rolodex:
 
         When the default AND query (all terms required) returns nothing,
         falls back to OR (any term matches) for better recall.
+
+        Phase 12: Optional source_type filter ('conversation', 'document', 'user_knowledge').
         """
         # Try full AND query first (FTS5 default: all terms must match)
-        results = self._fts_match(query, limit, conversation_id)
+        results = self._fts_match(query, limit, conversation_id, source_type=source_type)
 
         # If no results and query has multiple words, try OR fallback
         if not results and ' ' in query.strip():
@@ -213,12 +216,13 @@ class Rolodex:
             ]
             if len(terms) > 1:
                 or_query = ' OR '.join(terms)
-                results = self._fts_match(or_query, limit, conversation_id)
+                results = self._fts_match(or_query, limit, conversation_id, source_type=source_type)
 
         return results
 
     def _fts_match(
-        self, fts_query: str, limit: int, conversation_id: Optional[str] = None
+        self, fts_query: str, limit: int, conversation_id: Optional[str] = None,
+        source_type: Optional[str] = None,
     ) -> List[Tuple[RolodexEntry, float]]:
         """Execute a single FTS5 MATCH query."""
         sql = """
@@ -231,6 +235,9 @@ class Rolodex:
         if conversation_id:
             sql += " AND re.conversation_id = ?"
             params.append(conversation_id)
+        if source_type:
+            sql += " AND re.source_type = ?"
+            params.append(source_type)
         sql += " ORDER BY fts.rank LIMIT ?"
         params.append(limit)
         rows = self.conn.execute(sql, params).fetchall()
@@ -247,11 +254,14 @@ class Rolodex:
         query_embedding: List[float],
         limit: int = 5,
         min_similarity: float = 0.3,
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        source_type: Optional[str] = None,
     ) -> List[Tuple[RolodexEntry, float]]:
         """
         Vector similarity search using cosine similarity.
         Returns list of (entry, similarity_score) tuples, best first.
+
+        Phase 12: Optional source_type filter ('conversation', 'document', 'user_knowledge').
         """
         # Fetch all entries with embeddings
         sql = "SELECT * FROM rolodex_entries WHERE embedding IS NOT NULL"
@@ -259,6 +269,9 @@ class Rolodex:
         if conversation_id:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
+        if source_type:
+            sql += " AND source_type = ?"
+            params.append(source_type)
         rows = self.conn.execute(sql, params).fetchall()
         # Compute similarities
         scored = []
@@ -279,18 +292,22 @@ class Rolodex:
         keyword_weight: float = 0.4,
         semantic_weight: float = 0.6,
         min_similarity: float = 0.3,
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        source_type: Optional[str] = None,
     ) -> List[Tuple[RolodexEntry, float]]:
         """
         Combined keyword + semantic search with configurable weights.
         Returns merged, deduplicated results scored by weighted combination.
+
+        Phase 12: Optional source_type filter ('conversation', 'document', 'user_knowledge').
         """
         keyword_results = []
         semantic_results = []
         # Keyword search
         try:
             keyword_results = self.keyword_search(
-                query, limit=limit * 2, conversation_id=conversation_id
+                query, limit=limit * 2, conversation_id=conversation_id,
+                source_type=source_type,
             )
         except Exception:
             pass  # FTS might fail on some query formats
@@ -299,7 +316,8 @@ class Rolodex:
             semantic_results = self.semantic_search(
                 query_embedding, limit=limit * 2,
                 min_similarity=min_similarity,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                source_type=source_type,
             )
         # Merge results
         return _merge_search_results(
@@ -318,6 +336,7 @@ class Rolodex:
         keyword_weight: float = 0.4,
         semantic_weight: float = 0.6,
         min_similarity: float = 0.3,
+        source_type: Optional[str] = None,
     ) -> List[Tuple[RolodexEntry, float]]:
         """
         Cross-session hybrid search with current-session boosting.
@@ -325,6 +344,8 @@ class Rolodex:
         Searches ALL entries (no conversation_id filter), then boosts
         scores for entries from the current session. This prioritizes
         recent context while still surfacing knowledge from past sessions.
+
+        Phase 12: Optional source_type filter ('conversation', 'document', 'user_knowledge').
         """
         # Search globally (conversation_id=None)
         results = self.hybrid_search(
@@ -335,6 +356,7 @@ class Rolodex:
             semantic_weight=semantic_weight,
             min_similarity=min_similarity,
             conversation_id=None,  # Search ALL sessions
+            source_type=source_type,
         )
 
         if not current_session_id or boost_factor <= 1.0:
@@ -998,6 +1020,204 @@ class Rolodex:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    # ─── Browse (Phase 12) ─────────────────────────────────────────────
+
+    def browse_recent(self, limit: int = 20) -> List[RolodexEntry]:
+        """Fetch most recent entries across all sessions, excluding superseded."""
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE superseded_by IS NULL
+               ORDER BY created_at DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [deserialize_entry(row) for row in rows]
+
+    def browse_by_source_type(self, source_type: str, limit: int = 20) -> List[RolodexEntry]:
+        """Fetch entries filtered by source_type, excluding superseded."""
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE source_type = ? AND superseded_by IS NULL
+               ORDER BY created_at DESC LIMIT ?""",
+            (source_type, limit)
+        ).fetchall()
+        return [deserialize_entry(row) for row in rows]
+
+    def get_session_summaries(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get session summaries with entry counts and date ranges."""
+        rows = self.conn.execute(
+            """SELECT
+                   c.id,
+                   c.created_at,
+                   c.ended_at,
+                   c.summary,
+                   c.status,
+                   COUNT(re.id) as entry_count,
+                   MIN(re.created_at) as first_entry,
+                   MAX(re.created_at) as last_entry
+               FROM conversations c
+               LEFT JOIN rolodex_entries re ON re.conversation_id = c.id
+               GROUP BY c.id
+               ORDER BY c.created_at DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [
+            {
+                "session_id": row["id"],
+                "created_at": row["created_at"],
+                "ended_at": row["ended_at"],
+                "summary": row["summary"] or "",
+                "status": row["status"] or "unknown",
+                "entry_count": row["entry_count"],
+                "first_entry": row["first_entry"],
+                "last_entry": row["last_entry"],
+            }
+            for row in rows
+        ]
+
+    def browse_entry_by_prefix(self, prefix: str) -> Optional[RolodexEntry]:
+        """Find an entry by ID prefix (for short-id lookups)."""
+        rows = self.conn.execute(
+            "SELECT * FROM rolodex_entries WHERE id LIKE ?",
+            (prefix + "%",)
+        ).fetchall()
+        if len(rows) == 1:
+            return deserialize_entry(rows[0])
+        elif len(rows) > 1:
+            # Multiple matches — return the most recent
+            entries = [deserialize_entry(r) for r in rows]
+            entries.sort(key=lambda e: e.created_at, reverse=True)
+            return entries[0]
+        return None
+
+    # ─── Document Registry (Phase 12) ─────────────────────────────────
+
+    def register_document(
+        self,
+        doc_id: str,
+        file_name: str,
+        file_path: str,
+        file_type: str,
+        file_hash: Optional[str] = None,
+        title: Optional[str] = None,
+        page_count: Optional[int] = None,
+        summary: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Register a document in the registry. Returns doc_id."""
+        now = datetime.utcnow().isoformat()
+        self.conn.execute(
+            """INSERT INTO documents
+               (id, file_name, file_path, file_type, file_hash, title,
+                page_count, summary, registered_at, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (doc_id, file_name, file_path, file_type, file_hash,
+             title, page_count, summary, now,
+             json.dumps(metadata or {}))
+        )
+        self.conn.commit()
+        return doc_id
+
+    def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a registered document by ID."""
+        row = self.conn.execute(
+            "SELECT * FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "file_name": row["file_name"],
+            "file_path": row["file_path"],
+            "file_type": row["file_type"],
+            "file_hash": row["file_hash"],
+            "title": row["title"],
+            "page_count": row["page_count"],
+            "summary": row["summary"],
+            "registered_at": row["registered_at"],
+            "last_read_at": row["last_read_at"],
+            "metadata": json.loads(row["metadata"] or "{}"),
+        }
+
+    def list_documents(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List all registered documents."""
+        rows = self.conn.execute(
+            "SELECT * FROM documents ORDER BY registered_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "file_name": row["file_name"],
+                "file_path": row["file_path"],
+                "file_type": row["file_type"],
+                "title": row["title"],
+                "page_count": row["page_count"],
+                "registered_at": row["registered_at"],
+                "last_read_at": row["last_read_at"],
+            }
+            for row in rows
+        ]
+
+    def update_document_read_time(self, doc_id: str) -> None:
+        """Update last_read_at timestamp for a document."""
+        now = datetime.utcnow().isoformat()
+        self.conn.execute(
+            "UPDATE documents SET last_read_at = ? WHERE id = ?",
+            (now, doc_id)
+        )
+        self.conn.commit()
+
+    def update_document_hash(self, doc_id: str, file_hash: str) -> None:
+        """Update the file hash for change detection."""
+        self.conn.execute(
+            "UPDATE documents SET file_hash = ? WHERE id = ?",
+            (file_hash, doc_id)
+        )
+        self.conn.commit()
+
+    def remove_document(self, doc_id: str) -> bool:
+        """Unregister a document. Entries referencing it remain but link is cleared.
+        Returns True if the document existed."""
+        row = self.conn.execute(
+            "SELECT id FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()
+        if not row:
+            return False
+        # Clear document_id on linked entries (entries stay, just unlinked)
+        self.conn.execute(
+            "UPDATE rolodex_entries SET document_id = NULL WHERE document_id = ?",
+            (doc_id,)
+        )
+        self.conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        self.conn.commit()
+        return True
+
+    def get_entries_for_document(self, doc_id: str, limit: int = 50) -> List[RolodexEntry]:
+        """Fetch all entries linked to a specific document."""
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE document_id = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (doc_id, limit)
+        ).fetchall()
+        return [deserialize_entry(row) for row in rows]
+
+    def update_entry_document_source(
+        self,
+        entry_id: str,
+        document_id: str,
+        source_location: str = "",
+    ) -> None:
+        """Set the document source fields on an entry (Phase 12)."""
+        self.conn.execute(
+            """UPDATE rolodex_entries
+               SET source_type = 'document', document_id = ?, source_location = ?
+               WHERE id = ?""",
+            (document_id, source_location, entry_id)
+        )
+        self.conn.commit()
 
     def close(self):
         """Close the database connection."""

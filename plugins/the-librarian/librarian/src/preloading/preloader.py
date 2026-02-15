@@ -1,6 +1,12 @@
+"""
+The Librarian — Preload Orchestrator (Phase 3)
 
+Coordinates prediction strategies with cache warming.
+Like ABR streaming: adapts bandwidth to match conversation demand.
 
-
+High-confidence predictions → inject proactively into context
+Lower-confidence predictions → warm into hot cache for fast retrieval
+"""
 import json
 import uuid
 from typing import List, Optional
@@ -16,7 +22,15 @@ from .predictor import EmbeddingPredictor, LLMPredictor
 
 
 class Preloader:
-
+    """
+    Orchestrates the preloading pipeline:
+    1. Check pressure → choose strategy
+    2. Run prediction (embedding or LLM)
+    3. Split results by confidence threshold
+    4. High confidence → mark for proactive injection
+    5. All predictions → warm into hot cache
+    6. Log for accuracy tracking
+    """
 
     def __init__(
         self,
@@ -43,15 +57,21 @@ class Preloader:
         low_threshold: float = 0.3,
         high_threshold: float = 0.7,
     ) -> PreloadResult:
+        """
+        Run the full preload pipeline.
 
-
+        Returns a PreloadResult with:
+        - injected_entries: high-confidence, ready for proactive context
+        - cache_warmed_entries: loaded into hot cache for fast retrieval
+        - metadata: strategy used, pressure level, predictions
+        """
         pressure_val = self.pressure.get_pressure()
         strategy = self.pressure.get_strategy(low_threshold, high_threshold)
         limit = self.pressure.get_max_entries(
             low_threshold, high_threshold, max_entries
         )
 
-
+        # No preloading if insufficient data
         if strategy == "none":
             return PreloadResult(
                 strategy_used="none",
@@ -59,21 +79,21 @@ class Preloader:
                 turn_number=turn_number,
             )
 
-
+        # Run prediction(s)
         predictions: List[PreloadPrediction] = []
 
-
+        # Always run embedding predictor (cheap)
         embed_preds = await self.embedding_predictor.predict(
             recent_messages, limit=limit
         )
         predictions.extend(embed_preds)
 
-
+        # Escalate to LLM if high pressure
         if strategy == "llm":
             llm_preds = await self.llm_predictor.predict(
                 recent_messages, limit=limit
             )
-
+            # Merge, dedup by entry_id (keep highest confidence)
             seen = {p.entry_id: p for p in predictions}
             for p in llm_preds:
                 if p.entry_id not in seen or p.confidence > seen[p.entry_id].confidence:
@@ -82,7 +102,7 @@ class Preloader:
                 seen.values(), key=lambda p: p.confidence, reverse=True
             )[:limit]
 
-
+        # Split by confidence threshold
         injected_entries: List[RolodexEntry] = []
         cache_warmed_entries: List[RolodexEntry] = []
 
@@ -96,10 +116,11 @@ class Preloader:
             else:
                 cache_warmed_entries.append(entry)
 
-
+            # Warm into hot cache (WITHOUT updating access count —
+            # preloading is speculative, don't inflate real usage stats)
             self.rolodex._cache_put(entry)
 
-
+        # Log the preload event
         self._log_preload(
             conversation_id=conversation_id,
             turn_number=turn_number,
@@ -129,7 +150,7 @@ class Preloader:
         injected_ids: List[str],
         cache_warmed_ids: List[str],
     ) -> None:
-
+        """Log preload event to the preload_log table."""
         try:
             self.rolodex.conn.execute(
                 """INSERT INTO preload_log
@@ -146,10 +167,10 @@ class Preloader:
                     json.dumps([p.entry_id for p in predictions]),
                     json.dumps(injected_ids),
                     json.dumps(cache_warmed_ids),
-                    json.dumps([]),
+                    json.dumps([]),  # hit_entry_ids filled in later
                     datetime.utcnow().isoformat(),
                 )
             )
             self.rolodex.conn.commit()
         except Exception:
-            pass
+            pass  # Don't let logging failures break preloading

@@ -171,6 +171,44 @@ CREATE TABLE IF NOT EXISTS user_profile (
     updated_at DATETIME NOT NULL
 );
 
+-- Phase 12: Document registry — tracks registered documents for read-on-demand
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    file_hash TEXT,
+    title TEXT,
+    page_count INTEGER,
+    summary TEXT DEFAULT '',
+    registered_at DATETIME NOT NULL,
+    last_read_at DATETIME,
+    metadata TEXT DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_documents_file_type
+    ON documents(file_type);
+CREATE INDEX IF NOT EXISTS idx_documents_registered
+    ON documents(registered_at DESC);
+
+-- Phase 13: Project clusters — emergent groupings of related topics
+-- Auto-inferred from topic co-occurrence; optionally user-named (Option C hybrid)
+CREATE TABLE IF NOT EXISTS project_clusters (
+    id TEXT PRIMARY KEY,
+    label TEXT,
+    description TEXT DEFAULT '',
+    topic_ids TEXT NOT NULL DEFAULT '[]',
+    is_user_named INTEGER DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    last_active DATETIME,
+    session_count INTEGER DEFAULT 0,
+    entry_count INTEGER DEFAULT 0,
+    metadata TEXT DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_clusters_active
+    ON project_clusters(last_active DESC);
+
 -- Phase 10: Boot manifest — pre-computed context plan, refined each session
 CREATE TABLE IF NOT EXISTS boot_manifest (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +277,10 @@ def _safe_add_columns(conn: sqlite3.Connection):
         ("rolodex_entries", "superseded_by", "TEXT"),
         # Verbatim source flag: TRUE = original user/assistant text, FALSE = assistant summary/paraphrase
         ("rolodex_entries", "verbatim_source", "INTEGER DEFAULT 1"),
+        # Phase 12: Document source tracking
+        ("rolodex_entries", "source_type", "TEXT DEFAULT 'conversation'"),
+        ("rolodex_entries", "document_id", "TEXT"),
+        ("rolodex_entries", "source_location", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in additions:
         try:
@@ -246,6 +288,13 @@ def _safe_add_columns(conn: sqlite3.Connection):
             conn.commit()
         except sqlite3.OperationalError:
             pass  # Column already exists — that's fine
+
+    # Phase 12: Index for source_type filtering
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_source_type ON rolodex_entries(source_type)")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 # ─── Serialization ───────────────────────────────────────────────────────────
 def serialize_entry(entry: RolodexEntry) -> tuple:
     """Convert RolodexEntry to a tuple for SQL INSERT."""
@@ -289,6 +338,9 @@ def deserialize_entry(row: sqlite3.Row) -> RolodexEntry:
         linked_ids=json.loads(row["linked_ids"]) if row["linked_ids"] else [],
         metadata=json.loads(row["metadata"]) if row["metadata"] else {},
         verbatim_source=bool(row["verbatim_source"]) if "verbatim_source" in row.keys() else True,
+        source_type=row["source_type"] if "source_type" in row.keys() else "conversation",
+        document_id=row["document_id"] if "document_id" in row.keys() else None,
+        source_location=row["source_location"] if "source_location" in row.keys() else "",
     )
 def serialize_embedding(embedding: List[float]) -> bytes:
     """Pack a float list into compact binary (float32)."""

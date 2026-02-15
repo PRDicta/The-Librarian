@@ -1,6 +1,13 @@
+"""
+The Librarian — Chain Builder (Phase 7b)
 
+Generates breadcrumb snapshots of the reasoning thread.
+Triggered periodically (~5-10 turns) to capture narrative flow.
 
-
+Two modes:
+1. Enhanced (with API): Uses Haiku to summarize reasoning
+2. Verbatim (no API): Heuristic-based summarization
+"""
 import uuid
 from typing import List, Optional
 from datetime import datetime
@@ -31,7 +38,13 @@ Summary:"""
 
 
 class ChainBuilder:
+    """
+    Generates breadcrumb snapshots of the conversation reasoning thread.
 
+    Called periodically to freeze a "narrative index" of what's been discussed
+    and why. These chains become the first search target, guiding retrieval
+    of discrete facts.
+    """
 
     def __init__(
         self,
@@ -55,8 +68,19 @@ class ChainBuilder:
         turn_range_end: int,
         related_entry_ids: List[str],
     ) -> Optional[ReasoningChain]:
+        """
+        Create a narrative snapshot for a turn range.
 
+        Args:
+            session_id: Current conversation ID
+            messages: All messages in the session
+            turn_range_start: First turn in this segment
+            turn_range_end: Last turn in this segment
+            related_entry_ids: Rolodex entries created during this range
 
+        Returns:
+            ReasoningChain with summary + embedding, or None if failed
+        """
         segment_messages = [
             m for m in messages
             if turn_range_start <= m.turn_number <= turn_range_end
@@ -65,7 +89,7 @@ class ChainBuilder:
         if not segment_messages:
             return None
 
-
+        # Generate summary
         if self.llm_adapter:
             summary = await self._summarize_with_llm(
                 segment_messages, CHAIN_SUMMARY_PROMPT
@@ -78,11 +102,11 @@ class ChainBuilder:
 
         topics = self._extract_topics(segment_messages)
 
-
+        # Get next chain index
         existing_chains = self.rolodex.get_chains_for_session(session_id)
         next_index = len(existing_chains)
 
-
+        # Embed the summary for semantic chain search
         embedding = None
         if self.embeddings:
             try:
@@ -109,18 +133,20 @@ class ChainBuilder:
         messages: List[Message],
         related_entry_ids: List[str],
     ) -> Optional[ReasoningChain]:
-
-
+        """
+        Emergency deep-index snapshot when context window is filling.
+        Triggered at ~80% token pressure. Captures everything since last chain.
+        """
         if not messages:
             return None
 
-
+        # Find where the last chain left off
         existing_chains = self.rolodex.get_chains_for_session(session_id)
         last_indexed_turn = 0
         if existing_chains:
             last_indexed_turn = existing_chains[-1].turn_range_end
 
-
+        # Only capture un-chained turns
         if last_indexed_turn >= messages[-1].turn_number:
             return None
 
@@ -131,7 +157,7 @@ class ChainBuilder:
         if not segment_messages:
             return None
 
-
+        # Heavier summarization for emergency
         if self.llm_adapter:
             summary = await self._summarize_with_llm(
                 segment_messages, EMERGENCY_SUMMARY_PROMPT,
@@ -173,7 +199,7 @@ class ChainBuilder:
         prompt_template: str,
         max_chars_per_message: int = 500,
     ) -> str:
-
+        """Use LLM (Haiku) to summarize reasoning in a segment."""
         msg_text = "\n".join([
             f"{m.role.value.upper()}: {m.content[:max_chars_per_message]}"
             for m in messages
@@ -183,13 +209,13 @@ class ChainBuilder:
 
         try:
             import anthropic
-
+            # Use the adapter's client if available, else build one
             if hasattr(self.llm_adapter, '_client'):
                 client = self.llm_adapter._client
             elif hasattr(self.llm_adapter, 'client'):
                 client = self.llm_adapter.client
             else:
-
+                # Fallback: the adapter might have an api_key attribute
                 api_key = getattr(self.llm_adapter, 'api_key', None)
                 if not api_key:
                     return self._summarize_verbatim(messages)
@@ -201,7 +227,7 @@ class ChainBuilder:
                 messages=[{"role": "user", "content": prompt}]
             )
 
-
+            # Track cost if tracker available
             if self.cost_tracker and hasattr(response, "usage"):
                 self.cost_tracker.record(
                     call_type="chain_summary",
@@ -215,17 +241,17 @@ class ChainBuilder:
         except Exception:
             pass
 
-
+        # Fallback to heuristic
         return self._summarize_verbatim(messages)
 
     def _summarize_verbatim(self, messages: List[Message]) -> str:
-
+        """Heuristic summarization without API."""
         assistant_messages = [
             m for m in messages if m.role == MessageRole.ASSISTANT
         ]
 
         if not assistant_messages:
-
+            # Fall back to user messages
             user_messages = [
                 m for m in messages if m.role == MessageRole.USER
             ]
@@ -233,17 +259,17 @@ class ChainBuilder:
                 return f"Discussion: {user_messages[-1].content[:200]}..."
             return ""
 
-
+        # Use the assistant's last substantial message
         for msg in reversed(assistant_messages):
             if len(msg.content) > 100:
                 return f"Discussing: {msg.content[:200]}..."
 
-
+        # Short assistant messages — combine them
         combined = " ".join(m.content[:100] for m in assistant_messages)
         return f"Discussing: {combined[:200]}..."
 
     def _extract_topics(self, messages: List[Message]) -> List[str]:
-
+        """Extract topic keywords from messages."""
         stopwords = {
             'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
             'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
@@ -290,5 +316,5 @@ class ChainBuilder:
     def should_generate_breadcrumb(
         self, turn_count: int, last_chain_turn: int
     ) -> bool:
-
+        """Check if we should generate a breadcrumb at this turn."""
         return (turn_count - last_chain_turn) >= self.chain_interval

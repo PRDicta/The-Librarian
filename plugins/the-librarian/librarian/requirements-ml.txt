@@ -1,0 +1,14 @@
+# The Librarian — ML Dependencies (Optional)
+# These enable semantic embeddings via sentence-transformers.
+# Only install if the VM has sufficient disk space (~2 GB free).
+# If unavailable, The Librarian falls back to hash-based embeddings.
+
+-r requirements.txt
+
+# Embeddings (local, no API cost)
+sentence-transformers>=2.2.0
+torch>=2.0.0
+safetensors
+tokenizers
+transformers
+huggingface-hub

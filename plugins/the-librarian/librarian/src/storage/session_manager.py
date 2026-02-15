@@ -1,6 +1,13 @@
+"""
+The Librarian — Session Manager (Phase 4)
 
+Handles session lifecycle, message persistence, and cross-session
+awareness. Each session is a conversation with a unique ID; the
+rolodex DB persists all sessions, and messages are stored verbatim
+for resume capability.
 
-
+Multiple processes can share one DB file (SQLite WAL handles it).
+"""
 import uuid
 import sqlite3
 from typing import List, Optional
@@ -11,15 +18,26 @@ from ..core.types import (
 
 
 class SessionManager:
+    """
+    Manages session lifecycle and message persistence.
 
+    Responsibilities:
+    - Register/end sessions in the conversations table
+    - Persist every message for session resume
+    - List and load past sessions
+    - Track session metadata (message count, last active, summary)
+    """
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    # ─── Session Lifecycle ────────────────────────────────────────────────
 
     def start_session(self, conversation_id: str) -> SessionInfo:
-
-
+        """
+        Register a new session. Safe to call on existing sessions
+        (uses INSERT OR REPLACE to update timestamps).
+        """
         now = datetime.utcnow()
         self.conn.execute(
             """INSERT OR REPLACE INTO conversations
@@ -39,10 +57,11 @@ class SessionManager:
     def end_session(
         self, conversation_id: str, summary: str = ""
     ) -> None:
-
-
+        """
+        Mark a session as ended. Updates final counts and summary.
+        """
         now = datetime.utcnow()
-
+        # Compute final counts from DB
         msg_count = self._count_messages(conversation_id)
         entry_count = self._count_entries(conversation_id)
         token_count = self._count_tokens(conversation_id)
@@ -62,7 +81,7 @@ class SessionManager:
         self.conn.commit()
 
     def update_session_activity(self, conversation_id: str) -> None:
-
+        """Bump last_active and message_count after each turn."""
         now = datetime.utcnow()
         msg_count = self._count_messages(conversation_id)
         self.conn.execute(
@@ -73,10 +92,13 @@ class SessionManager:
         )
         self.conn.commit()
 
+    # ─── Session Listing ──────────────────────────────────────────────────
 
     def list_sessions(self, limit: int = 20) -> List[SessionInfo]:
-
-
+        """
+        List recent sessions, most recently active first.
+        Returns SessionInfo objects with metadata.
+        """
         rows = self.conn.execute(
             """SELECT id, created_at, last_active, ended_at,
                       message_count, entry_count, summary, status
@@ -107,7 +129,7 @@ class SessionManager:
         return sessions
 
     def get_session(self, conversation_id: str) -> Optional[SessionInfo]:
-
+        """Get info about a specific session."""
         row = self.conn.execute(
             """SELECT id, created_at, last_active, ended_at,
                       message_count, entry_count, summary, status
@@ -133,10 +155,13 @@ class SessionManager:
             status=row["status"] or "active",
         )
 
+    # ─── Message Persistence ──────────────────────────────────────────────
 
     def save_message(self, conversation_id: str, message: Message) -> str:
-
-
+        """
+        Persist a single message to the messages table.
+        Returns the message ID.
+        """
         msg_id = str(uuid.uuid4())
         self.conn.execute(
             """INSERT INTO messages
@@ -157,8 +182,10 @@ class SessionManager:
         return msg_id
 
     def load_messages(self, conversation_id: str) -> List[Message]:
-
-
+        """
+        Load all messages for a session, ordered by turn number.
+        Used for session resume.
+        """
         rows = self.conn.execute(
             """SELECT role, content, turn_number, token_count, timestamp
                FROM messages
@@ -179,9 +206,10 @@ class SessionManager:
             messages.append(msg)
         return messages
 
+    # ─── Internal Helpers ─────────────────────────────────────────────────
 
     def _count_messages(self, conversation_id: str) -> int:
-
+        """Count persisted messages for a session."""
         row = self.conn.execute(
             "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ?",
             (conversation_id,)
@@ -189,7 +217,7 @@ class SessionManager:
         return row["cnt"] if row else 0
 
     def _count_entries(self, conversation_id: str) -> int:
-
+        """Count rolodex entries for a session."""
         row = self.conn.execute(
             "SELECT COUNT(*) as cnt FROM rolodex_entries WHERE conversation_id = ?",
             (conversation_id,)
@@ -197,7 +225,7 @@ class SessionManager:
         return row["cnt"] if row else 0
 
     def _count_tokens(self, conversation_id: str) -> int:
-
+        """Sum token counts for all messages in a session."""
         row = self.conn.execute(
             "SELECT COALESCE(SUM(token_count), 0) as total FROM messages WHERE conversation_id = ?",
             (conversation_id,)
@@ -205,8 +233,10 @@ class SessionManager:
         return row["total"] if row else 0
 
     def find_session_by_prefix(self, prefix: str) -> Optional[str]:
-
-
+        """
+        Find a session ID by its prefix (for user-friendly /resume commands).
+        Returns the full session ID if exactly one match, None otherwise.
+        """
         rows = self.conn.execute(
             "SELECT id FROM conversations WHERE id LIKE ?",
             (prefix + "%",)
