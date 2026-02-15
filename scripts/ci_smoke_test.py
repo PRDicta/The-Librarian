@@ -44,8 +44,14 @@ def find_executable():
 
     if not exe.exists():
         print(f"FATAL: Executable not found at {exe}")
+        # List what's actually in dist/ for debugging
+        if dist.exists():
+            print(f"Contents of {dist}/:")
+            for item in sorted(dist.rglob("*"))[:30]:
+                print(f"  {item}")
         sys.exit(1)
-    return str(exe)
+    # Return absolute path so it works regardless of cwd
+    return str(exe.resolve())
 
 
 def run_cmd(exe, args, timeout=TIMEOUT_CMD, work_dir=None):

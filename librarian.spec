@@ -64,9 +64,16 @@ hidden_imports = [
 ]
 
 if IS_LEAN:
-    # Lean build: installer GUI + init only. No ML stack.
-    # Networking for Anthropic SDK (small, useful for future verification)
+    # Lean build: installer GUI + ONNX embeddings. No PyTorch/ML stack.
     hidden_imports += [
+        # ONNX embedding runtime
+        "numpy",
+        "numpy.core",
+        "numpy.core._methods",
+        "numpy.lib",
+        "numpy.lib.format",
+        "onnxruntime",
+        # Networking for Anthropic SDK
         "anthropic",
         "httpx",
         "httpcore",
@@ -187,13 +194,14 @@ excludes = [
     "pytest", "pytest_asyncio", "_pytest", "tests",
     "IPython", "jupyter", "notebook",
     "matplotlib", "pandas", "scipy", "sklearn", "PIL", "cv2",
-    "tensorflow", "onnxruntime", "torchaudio", "torchvision",
+    "tensorflow", "torchaudio", "torchvision",
 ]
 
 if IS_LEAN:
-    # Lean build: exclude the entire ML stack — it's not needed for the installer
+    # Lean build: exclude the heavy ML stack (PyTorch, sentence-transformers).
+    # Keep numpy + onnxruntime — the lean build uses ONNX for embeddings.
     excludes += [
-        "torch", "numpy", "sentence_transformers", "transformers",
+        "torch", "sentence_transformers", "transformers",
         "tokenizers", "safetensors", "huggingface_hub",
     ]
 else:
