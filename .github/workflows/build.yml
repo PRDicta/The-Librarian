@@ -52,6 +52,11 @@ jobs:
       - name: Build (lean)
         run: python build.py --skip-venv
 
+      - name: Smoke test
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python scripts/ci_smoke_test.py
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
