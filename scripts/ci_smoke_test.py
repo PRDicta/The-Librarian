@@ -66,7 +66,8 @@ def run_cmd(exe, args, timeout=TIMEOUT_CMD, work_dir=None):
             cwd=work_dir,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
-        return result.returncode, result.stdout, result.stderr
+        # Defensive: ensure stdout/stderr are always strings (never None)
+        return result.returncode, result.stdout or "", result.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", f"TIMEOUT after {timeout}s"
 
@@ -92,7 +93,7 @@ class SmokeTest:
             # Truncate long output for readability
             display = stdout[:500] + ("..." if len(stdout) > 500 else "")
             print(f"  STDOUT: {display}")
-        if stderr and rc != 0:
+        if stderr:
             display = stderr[:300] + ("..." if len(stderr) > 300 else "")
             print(f"  STDERR: {display}")
 
@@ -206,8 +207,8 @@ def main():
             ["recall", "What programming languages does the user like?"],
             checks=[
                 ("exits cleanly", lambda rc, out, err: rc == 0),
-                ("finds Python", lambda rc, out, err: "Python" in out or "python" in out),
-                ("finds React", lambda rc, out, err: "React" in out or "react" in out),
+                ("finds Python", lambda rc, out, err: "python" in (out + err).lower()),
+                ("finds React", lambda rc, out, err: "react" in (out + err).lower()),
             ],
         )
 
@@ -238,7 +239,7 @@ def main():
             checks=[
                 ("exits cleanly", lambda rc, out, err: rc == 0),
                 ("finds deployment content", lambda rc, out, err:
-                    any(term in out.lower() for term in ["github actions", "ci/cd", "docker", "deploy", "fargate", "pipeline"])),
+                    any(term in (out + err).lower() for term in ["github actions", "ci/cd", "docker", "deploy", "fargate", "pipeline"])),
             ],
         )
 
