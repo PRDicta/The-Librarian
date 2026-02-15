@@ -31,12 +31,21 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 def export():
     print(f"Exporting {MODEL_NAME} to ONNX format...")
 
-    # Ensure model directory exists and has the base model
+    # Ensure model directory exists and has the base model.
+    # On CI runners or fresh machines, download it automatically.
     if not os.path.isdir(MODEL_DIR):
-        print(f"Model directory not found: {MODEL_DIR}")
-        print("Run build.py first to download the model, or:")
-        print(f"  pip install sentence-transformers && python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{MODEL_NAME}')\"")
-        sys.exit(1)
+        print(f"  Model not found locally — downloading {MODEL_NAME} from HuggingFace...")
+        try:
+            from sentence_transformers import SentenceTransformer
+            st_model = SentenceTransformer(MODEL_NAME)
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            st_model.save(MODEL_DIR)
+            print(f"  Model downloaded and saved to {MODEL_DIR}")
+        except ImportError:
+            print(f"Model directory not found: {MODEL_DIR}")
+            print("Install sentence-transformers to auto-download, or run build.py first:")
+            print(f"  pip install sentence-transformers && python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{MODEL_NAME}')\"")
+            sys.exit(1)
 
     import torch
     from transformers import AutoModel, AutoTokenizer
