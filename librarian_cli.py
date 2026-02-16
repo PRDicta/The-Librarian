@@ -2436,15 +2436,18 @@ def cmd_init(target_dir):
             shutil.copytree(bundle_src, dst_src, ignore=shutil.ignore_patterns(
                 "__pycache__", "*.pyc", ".pytest_cache"
             ))
-        # Copy ONNX model if bundled
-        bundle_model = os.path.join(cowork_src, "models", "all-MiniLM-L6-v2")
-        if os.path.isdir(bundle_model):
-            dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
-            os.makedirs(dst_model, exist_ok=True)
-            for mf in ("model.onnx", "tokenizer.json"):
-                src_mf = os.path.join(bundle_model, mf)
-                if os.path.isfile(src_mf):
-                    shutil.copy2(src_mf, os.path.join(dst_model, mf))
+        # Copy ONNX model if bundled (non-fatal — hash fallback exists)
+        try:
+            bundle_model = os.path.join(cowork_src, "models", "all-MiniLM-L6-v2")
+            if os.path.isdir(bundle_model):
+                dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
+                os.makedirs(dst_model, exist_ok=True)
+                for mf in ("model.onnx", "tokenizer.json"):
+                    src_mf = os.path.join(bundle_model, mf)
+                    if os.path.isfile(src_mf):
+                        shutil.copy2(src_mf, os.path.join(dst_model, mf))
+        except OSError:
+            pass  # ONNX model is optional — hash embeddings work as fallback
     else:
         # Development layout: copy from SCRIPT_DIR
         for fname in ("librarian_cli.py", "main.py", "requirements.txt", "requirements-onnx.txt", "requirements-ml.txt"):
@@ -2457,15 +2460,18 @@ def cmd_init(target_dir):
             shutil.copytree(src_dir, dst_src, ignore=shutil.ignore_patterns(
                 "__pycache__", "*.pyc", ".pytest_cache"
             ))
-        # Copy ONNX model from dev layout
-        dev_model = os.path.join(SCRIPT_DIR, "lib", "models", "all-MiniLM-L6-v2")
-        if os.path.isdir(dev_model):
-            dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
-            os.makedirs(dst_model, exist_ok=True)
-            for mf in ("model.onnx", "tokenizer.json"):
-                src_mf = os.path.join(dev_model, mf)
-                if os.path.isfile(src_mf):
-                    shutil.copy2(src_mf, os.path.join(dst_model, mf))
+        # Copy ONNX model from dev layout (non-fatal — hash fallback exists)
+        try:
+            dev_model = os.path.join(SCRIPT_DIR, "lib", "models", "all-MiniLM-L6-v2")
+            if os.path.isdir(dev_model):
+                dst_model = os.path.join(lib_dest, "models", "all-MiniLM-L6-v2")
+                os.makedirs(dst_model, exist_ok=True)
+                for mf in ("model.onnx", "tokenizer.json"):
+                    src_mf = os.path.join(dev_model, mf)
+                    if os.path.isfile(src_mf):
+                        shutil.copy2(src_mf, os.path.join(dst_model, mf))
+        except OSError:
+            pass  # ONNX model is optional — hash embeddings work as fallback
 
     # 2. Create a pre-seeded rolodex.db with schema + welcome context
     #    This avoids the 0-byte DB problem — the file ships as a valid SQLite DB.
