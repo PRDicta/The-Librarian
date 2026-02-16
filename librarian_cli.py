@@ -970,8 +970,13 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
     all_candidates = []  # List of (entry, score) tuples
     seen_ids = set()
 
+    # Debug: trace recall pipeline on all platforms
+    _dbg = lambda msg: print(f"[recall-dbg] {msg}", file=sys.stderr, flush=True)
+    _dbg(f"variants={len(expanded.variants)} query={query[:60]}")
+
     for variant in expanded.variants:
         response = await lib.retrieve(variant, limit=WIDE_NET_LIMIT)
+        _dbg(f"  variant={variant[:40]}... found={response.found} entries={len(response.entries)}")
         if response.found:
             for entry in response.entries:
                 # Phase 12: Filter by source_type if specified
@@ -982,6 +987,8 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
                     # Use search position as a proxy score (first = highest)
                     score = 1.0 - (len(all_candidates) * 0.01)
                     all_candidates.append((entry, max(score, 0.1)))
+
+    _dbg(f"total_candidates={len(all_candidates)}")
 
     if all_candidates:
         # Phase 13: --fresh mode — filter to recent entries and boost recency
@@ -1058,10 +1065,14 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
             meta_parts.append(f"{entity_count} entities")
         print(f"[{' | '.join(meta_parts)}]", flush=True)
 
-        print(lib.get_context_block(synthetic_response), flush=True)
+        context_block = lib.get_context_block(synthetic_response)
+        _dbg(f"context_block_len={len(context_block)}")
+        print(context_block, flush=True)
     else:
+        _dbg("no candidates — printing fallback message")
         print("No relevant memories found.", flush=True)
 
+    _dbg("recall complete")
     close_db(lib)
 
 
@@ -2853,6 +2864,90 @@ def _self_install_to_path():
         pass  # Best-effort — Cowork doesn't need this
 
 
+async def cmd_pulse():
+    """Heartbeat check — is The Librarian alive and running?
+
+    Lightweight probe that returns status without booting.
+    If not alive, returns needs_boot=True so the caller knows to boot.
+    """
+    from src.core.maintenance import pulse_check
+
+    db_path, _ = _resolve_db_path()
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    result = pulse_check(conn, SESSION_FILE)
+    conn.close()
+    print(json.dumps(result))
+
+
+async def cmd_maintain(
+    token_budget: int = 0,
+    cooldown_hours: float = 4.0,
+    force: bool = False,
+):
+    """Run background maintenance passes on the knowledge graph.
+
+    Checks cooldown first (skip if ran recently), then runs all passes:
+    contradiction detection, orphaned correction linking, near-duplicate
+    merging, entry promotion, and stale temporal flagging.
+
+    Token budget is dynamic by default: measures the actual DB content size
+    and sets the budget to cover the full corpus with 20% headroom. For
+    large DBs (enterprise scale), caps at MAINTAIN_BUDGET_CAP to keep
+    the duplicate pass (O(n^2)) bounded. At the cap, maintenance rotates
+    through the DB across multiple idle windows.
+    """
+    from src.core.maintenance import MaintenanceEngine, check_cooldown
+
+    # Budget cap for large DBs — keeps the O(n^2) duplicate pass bounded.
+    # At 500k tokens (~30k entries), a single pass takes ~2-3s. Beyond that,
+    # topic rotation across idle windows is the better strategy.
+    MAINTAIN_BUDGET_CAP = 500_000
+
+    lib, mode = _make_librarian()
+    session_id = load_session_id()
+
+    # Check cooldown (unless --force)
+    if not force:
+        can_run, last_completed = check_cooldown(lib.rolodex.conn, cooldown_hours)
+        if not can_run:
+            print(json.dumps({
+                "status": "skipped",
+                "reason": "cooldown",
+                "last_completed_at": last_completed,
+                "cooldown_hours": cooldown_hours,
+                "message": f"Last maintenance ran at {last_completed}. Use --force to override.",
+            }))
+            close_db(lib)
+            return
+
+    # Dynamic budget: measure DB, cover it all (with cap for large DBs)
+    if token_budget == 0:
+        row = lib.rolodex.conn.execute(
+            "SELECT SUM(LENGTH(content)) / 4 as est_tokens FROM rolodex_entries WHERE superseded_by IS NULL"
+        ).fetchone()
+        db_tokens = row["est_tokens"] or 15000
+        # 1.2x headroom so passes don't run out mid-scan
+        token_budget = min(int(db_tokens * 1.2), MAINTAIN_BUDGET_CAP)
+        budget_mode = "dynamic"
+    else:
+        budget_mode = "manual"
+
+    # Run maintenance
+    engine = MaintenanceEngine(
+        conn=lib.rolodex.conn,
+        session_id=session_id,
+        token_budget=token_budget,
+    )
+    report = engine.run_all()
+    report["budget_mode"] = budget_mode
+
+    print(json.dumps(report, indent=2))
+    close_db(lib)
+
+
 async def main():
     if len(sys.argv) < 2:
         # No arguments: launch GUI installer if frozen, else show usage
@@ -3060,8 +3155,34 @@ async def main():
             args = sys.argv[3:] if len(sys.argv) > 3 else []
             await cmd_history(subcmd, args)
 
+        elif cmd == "pulse":
+            await cmd_pulse()
+
+        elif cmd == "maintain":
+            # Parse optional flags
+            maintain_budget = 0  # 0 = dynamic (auto-size to DB)
+            maintain_cooldown = 4.0
+            maintain_force = False
+            remaining = sys.argv[2:]
+            mi = 0
+            while mi < len(remaining):
+                if remaining[mi] == "--budget" and mi + 1 < len(remaining):
+                    mi += 1
+                    maintain_budget = int(remaining[mi])
+                elif remaining[mi] == "--cooldown" and mi + 1 < len(remaining):
+                    mi += 1
+                    maintain_cooldown = float(remaining[mi])
+                elif remaining[mi] == "--force":
+                    maintain_force = True
+                mi += 1
+            await cmd_maintain(
+                token_budget=maintain_budget,
+                cooldown_hours=maintain_cooldown,
+                force=maintain_force,
+            )
+
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
             sys.exit(1)
 
     except Exception as e:
