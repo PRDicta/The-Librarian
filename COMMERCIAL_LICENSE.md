@@ -56,6 +56,43 @@ If you are using The Librarian for personal projects, academic research,
 or open-source work where you can comply with AGPL-3.0 terms, no
 commercial license is needed. The open-source edition is fully functional.
 
+## Definitions
+
+A **developer** is any individual who directly interacts with, modifies,
+integrates, or deploys The Librarian as part of their work. Individuals
+who merely use a product or service that incorporates The Librarian are
+not counted as developers.
+
+## Sublicensing
+
+Commercial licenses are not sublicensable. You may distribute The
+Librarian as part of your product, but your customers may not
+redistribute it further without their own license or written consent
+from Dicta Technologies Inc.
+
+## Termination
+
+Violation of any term of this license automatically terminates your
+rights under it. Upon termination, you must cease all use and
+distribution of The Librarian. Termination does not entitle the
+licensee to a refund.
+
+## Disclaimer of warranties
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL DICTA TECHNOLOGIES INC. BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Governing law
+
+This license is governed by the laws of the Province of Ontario, Canada.
+Any disputes arising under this license shall be resolved in the courts
+of the Province of Ontario.
+
 ## Purchase
 
 - Email: licensing@usedicta.com
