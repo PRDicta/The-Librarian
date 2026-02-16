@@ -89,9 +89,9 @@ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Governing law
 
-This license is governed by the laws of the Province of Ontario, Canada.
+This license is governed by the laws of the Province of British Columbia, Canada.
 Any disputes arising under this license shall be resolved in the courts
-of the Province of Ontario.
+of the Province of British Columbia.
 
 ## Purchase
 
