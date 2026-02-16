@@ -1,5 +1,6 @@
 # Release Notes — The Librarian
 
+If The Librarian was useful to you, please consider [buying me a drink](https://buymeacoffee.com/chief_librarian).
 ## v1.1.0 — License Change (2026-02-16)
 
 **License: Dual-licensed under AGPL-3.0 + Commercial**

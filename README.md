@@ -4,6 +4,8 @@
 
 It works at the application layer, not the model layer. Ground truth is stored locally and injected at retrieval time, making it compatible with any LLM regardless of architecture.
 
+If The Librarian was useful to you, please consider [buying me a drink](https://buymeacoffee.com/chief_librarian).
+
 ## Why this exists
 
 Every conversation with an AI starts from zero. You explain who you are, what you're working on, what you've already tried...and then the context window fills up and you start over. Three hundred sessions in, you're still introducing yourself and explaining you're not "the user". It's embarrassing.
