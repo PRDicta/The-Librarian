@@ -3,8 +3,12 @@ The Librarian — Context Builder
 Formats retrieved rolodex entries into a coherent context block
 for injection into the working agent's prompt.
 """
+from datetime import datetime, timezone
 from typing import List, Optional, Any, Dict
 from ..core.types import RolodexEntry
+
+# Default staleness threshold in hours
+DEFAULT_STALE_THRESHOLD_HOURS = 24
 class ContextBuilder:
     """
     Formats retrieved entries into a readable context block
@@ -78,6 +82,45 @@ class ContextBuilder:
         lines.append(self.CHAIN_FOOTER)
         return "\n".join(lines)
 
+    @staticmethod
+    def _staleness_label(entry: RolodexEntry, stale_threshold_hours: float = DEFAULT_STALE_THRESHOLD_HOURS) -> str:
+        """Return a staleness flag string for an entry, or empty string if fresh.
+
+        Thresholds:
+          - < stale_threshold_hours  → "" (no flag)
+          - < 7 days                 → "[STALE: Xd Yh ago]"
+          - >= 7 days                → "[STALE: Xd ago]"
+        """
+        created = getattr(entry, "created_at", None)
+        if created is None:
+            return ""
+        try:
+            now = datetime.utcnow()
+            if hasattr(created, "timestamp"):
+                age_seconds = (now - created).total_seconds()
+            else:
+                age_seconds = (now - datetime.utcfromtimestamp(float(created))).total_seconds()
+
+            if age_seconds < 0:
+                return ""
+
+            age_hours = age_seconds / 3600
+            if age_hours < stale_threshold_hours:
+                return ""
+
+            age_days = age_seconds / 86400
+            if age_days >= 7:
+                return f"[STALE: {int(age_days)}d ago]"
+            else:
+                d = int(age_days)
+                h = int(age_hours - d * 24)
+                if d > 0:
+                    return f"[STALE: {d}d {h}h ago]"
+                else:
+                    return f"[STALE: {h}h ago]"
+        except (TypeError, ValueError):
+            return ""
+
     def _format_entry(
         self,
         entry: RolodexEntry,
@@ -90,7 +133,10 @@ class ContextBuilder:
         category_label = entry.category.value.upper()
         tags_str = ", ".join(entry.tags) if entry.tags else ""
         verbatim_flag = "" if getattr(entry, "verbatim_source", True) else "  [SUMMARY]"
+        stale_flag = self._staleness_label(entry)
         header = f"[{index}] [{category_label}]{verbatim_flag}"
+        if stale_flag:
+            header += f"  {stale_flag}"
         if tags_str:
             header += f"  Tags: {tags_str}"
         # Phase 4: tag cross-session entries

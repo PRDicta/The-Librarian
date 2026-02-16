@@ -940,7 +940,7 @@ async def cmd_batch_ingest(json_path):
     }))
 
 
-async def cmd_recall(query, source_type=None):
+async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
     """Search memory, return formatted context block.
 
     Phase 11: Wide-net-then-narrow search pattern.
@@ -951,6 +951,9 @@ async def cmd_recall(query, source_type=None):
     4. Return top 5 re-ranked results
 
     Phase 12: Optional --source filter ('conversation', 'document', 'user_knowledge').
+    Phase 13: Optional --fresh flag — prioritize recent entries, filtering out
+    anything older than fresh_hours (default 48h). Useful when verifying
+    whether a previously-known status is still current.
     """
     lib, _ = _make_librarian()
     _ensure_session(lib, caller="recall")
@@ -981,14 +984,41 @@ async def cmd_recall(query, source_type=None):
                     all_candidates.append((entry, max(score, 0.1)))
 
     if all_candidates:
+        # Phase 13: --fresh mode — filter to recent entries and boost recency
+        if fresh:
+            from datetime import datetime as _dt
+            now = _dt.utcnow()
+            cutoff_seconds = fresh_hours * 3600
+            fresh_candidates = [
+                (entry, score) for entry, score in all_candidates
+                if hasattr(entry, 'created_at') and entry.created_at is not None
+                and (now - entry.created_at).total_seconds() < cutoff_seconds
+            ]
+            filtered_count = len(all_candidates) - len(fresh_candidates)
+            if fresh_candidates:
+                all_candidates = fresh_candidates
+            # If all candidates are stale, keep them but warn
+            elif filtered_count > 0:
+                print(f"[fresh: all {len(all_candidates)} candidates older than {fresh_hours}h — showing anyway with staleness flags]", flush=True)
+
         # Phase 11: Re-rank the wide pool using multiple signals
+        rerank_limit = 10 if fresh else 5  # Wider pool in fresh mode for recency re-sort
         scored = reranker.rerank(
             candidates=all_candidates,
             query=query,
             query_entities=expanded.entities,
             category_bias=expanded.category_bias,
-            limit=5,
+            limit=rerank_limit,
         )
+
+        # Phase 13: In fresh mode, re-sort by recency (newest first) after reranking
+        if fresh:
+            scored.sort(
+                key=lambda sc: sc.entry.created_at.timestamp()
+                if hasattr(sc.entry.created_at, 'timestamp') else 0,
+                reverse=True,
+            )
+            scored = scored[:5]
 
         # Extract entries from scored candidates
         all_entries = [sc.entry for sc in scored]
@@ -1018,6 +1048,8 @@ async def cmd_recall(query, source_type=None):
         # Show search metadata
         entity_count = len(expanded.entities.all_entities) if expanded.entities else 0
         meta_parts = []
+        if fresh:
+            meta_parts.append(f"fresh: <{fresh_hours}h")
         if expanded.intent != "exploratory":
             meta_parts.append(f"intent: {expanded.intent}")
         meta_parts.append(f"{len(expanded.variants)} variants")
@@ -2875,18 +2907,29 @@ async def main():
 
         elif cmd == "recall":
             if len(sys.argv) < 3:
-                print(json.dumps({"error": "Usage: librarian_cli.py recall \"<query>\" [--source conversation|document]"}))
+                print(json.dumps({"error": "Usage: librarian_cli.py recall \"<query>\" [--source conversation|document] [--fresh [hours]]"}))
                 sys.exit(1)
             recall_query = sys.argv[2]
             recall_source = None
+            recall_fresh = False
+            recall_fresh_hours = 48.0
             remaining = sys.argv[3:]
             ri = 0
             while ri < len(remaining):
                 if remaining[ri] == "--source" and ri + 1 < len(remaining):
                     ri += 1
                     recall_source = remaining[ri]
+                elif remaining[ri] == "--fresh":
+                    recall_fresh = True
+                    # Optional hours argument
+                    if ri + 1 < len(remaining) and not remaining[ri + 1].startswith("--"):
+                        try:
+                            recall_fresh_hours = float(remaining[ri + 1])
+                            ri += 1
+                        except ValueError:
+                            pass  # Not a number, leave default
                 ri += 1
-            await cmd_recall(recall_query, source_type=recall_source)
+            await cmd_recall(recall_query, source_type=recall_source, fresh=recall_fresh, fresh_hours=recall_fresh_hours)
 
         elif cmd == "stats":
             await cmd_stats()
