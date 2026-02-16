@@ -59,6 +59,5 @@ commercial license is needed. The open-source edition is fully functional.
 ## Purchase
 
 - Email: licensing@usedicta.com
-- Web: https://usedicta.com
 
 Copyright (c) 2026 Dicta Technologies Inc. All rights reserved.
