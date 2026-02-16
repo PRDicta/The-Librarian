@@ -273,21 +273,16 @@ class Rolodex:
             sql += " AND source_type = ?"
             params.append(source_type)
         rows = self.conn.execute(sql, params).fetchall()
-        import sys as _sys
-        print(f"[semantic-dbg] rows_with_embedding={len(rows)} conv_filter={conversation_id is not None} query_emb_len={len(query_embedding)}", file=_sys.stderr, flush=True)
         # Compute similarities
         scored = []
         for row in rows:
             entry = deserialize_entry(row)
             if entry.embedding:
                 sim = _cosine_similarity(query_embedding, entry.embedding)
-                if len(scored) < 3:  # Debug first few
-                    print(f"[semantic-dbg]   entry={entry.id[:8]}... emb_len={len(entry.embedding)} sim={sim:.4f} min={min_similarity}", file=_sys.stderr, flush=True)
                 if sim >= min_similarity:
                     scored.append((entry, sim))
         # Sort by similarity descending
         scored.sort(key=lambda x: x[1], reverse=True)
-        print(f"[semantic-dbg] scored={len(scored)} (above min_sim={min_similarity})", file=_sys.stderr, flush=True)
         return scored[:limit]
     def hybrid_search(
         self,

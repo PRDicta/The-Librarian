@@ -279,14 +279,11 @@ class TheLibrarian:
                 limit=limit or self.config.search_result_limit,
                 conversation_id=self.state.conversation_id,
             )
-            import sys as _sys
-            print(f"[retrieve-dbg] conv_id={self.state.conversation_id} cross={self.config.cross_session_search} limit={query.limit}", file=_sys.stderr, flush=True)
             response = await self.librarian_agent.answer_query(
                 query,
                 cross_session=self.config.cross_session_search,
                 session_boost_factor=self.config.session_boost_factor,
             )
-            print(f"[retrieve-dbg] found={response.found} entries={len(response.entries)}", file=_sys.stderr, flush=True)
             return response
         finally:
             # Phase 8: Resume enrichment workers

@@ -65,6 +65,8 @@ def run_cmd(exe, args, timeout=TIMEOUT_CMD, work_dir=None):
             timeout=timeout,
             cwd=work_dir,
             env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
+            encoding="utf-8",
+            errors="replace",
         )
         # Defensive: ensure stdout/stderr are always strings (never None)
         return result.returncode, result.stdout or "", result.stderr or ""

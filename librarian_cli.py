@@ -970,13 +970,8 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
     all_candidates = []  # List of (entry, score) tuples
     seen_ids = set()
 
-    # Debug: trace recall pipeline on all platforms
-    _dbg = lambda msg: print(f"[recall-dbg] {msg}", file=sys.stderr, flush=True)
-    _dbg(f"variants={len(expanded.variants)} query={query[:60]}")
-
     for variant in expanded.variants:
         response = await lib.retrieve(variant, limit=WIDE_NET_LIMIT)
-        _dbg(f"  variant={variant[:40]}... found={response.found} entries={len(response.entries)}")
         if response.found:
             for entry in response.entries:
                 # Phase 12: Filter by source_type if specified
@@ -987,8 +982,6 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
                     # Use search position as a proxy score (first = highest)
                     score = 1.0 - (len(all_candidates) * 0.01)
                     all_candidates.append((entry, max(score, 0.1)))
-
-    _dbg(f"total_candidates={len(all_candidates)}")
 
     if all_candidates:
         # Phase 13: --fresh mode — filter to recent entries and boost recency
@@ -1065,14 +1058,10 @@ async def cmd_recall(query, source_type=None, fresh=False, fresh_hours=48.0):
             meta_parts.append(f"{entity_count} entities")
         print(f"[{' | '.join(meta_parts)}]", flush=True)
 
-        context_block = lib.get_context_block(synthetic_response)
-        _dbg(f"context_block_len={len(context_block)}")
-        print(context_block, flush=True)
+        print(lib.get_context_block(synthetic_response), flush=True)
     else:
-        _dbg("no candidates — printing fallback message")
         print("No relevant memories found.", flush=True)
 
-    _dbg("recall complete")
     close_db(lib)
 
 
