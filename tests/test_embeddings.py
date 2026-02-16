@@ -65,6 +65,7 @@ def test_local_embed_with_mock():
 
     mgr = EmbeddingManager(strategy="local", dimensions=384)
     mgr._local_model = mock_model  # Inject mock model
+    mgr.strategy = "local"  # Reset strategy (init may have downgraded it)
 
     result = asyncio.run(mgr.embed_text("test with local model"))
     assert len(result) == 384, f"Expected 384 dims, got {len(result)}"

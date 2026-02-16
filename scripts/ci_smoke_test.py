@@ -218,12 +218,20 @@ def main():
             ],
         )
 
+        # ── Test 4b: Verify DB has entries (diagnostic for cross-process WAL) ──
+        t.run(
+            "DB has ingested entries (stats check)",
+            ["stats"],
+            checks=[
+                ("exits cleanly", lambda rc, out, err: rc == 0),
+                ("entry count > 0", lambda rc, out, err: '"total_entries"' in out and '"total_entries": 0' not in out),
+            ],
+        )
+
         # ── Test 5: Recall (semantic search) ──
-        # Known issue: Windows frozen binary recall produces no output (under investigation)
         t.run(
             "Recall finds ingested content",
             ["recall", "What programming languages does the user like?"],
-            warn_only=is_windows,
             checks=[
                 ("exits cleanly", lambda rc, out, err: rc == 0),
                 ("finds Python", lambda rc, out, err: "python" in (out + err).lower()),
@@ -252,11 +260,9 @@ def main():
             ],
         )
 
-        # Known issue: Windows frozen binary recall produces no output (under investigation)
         t.run(
             "Recall second topic (CI/CD)",
             ["recall", "How do we deploy code to production?"],
-            warn_only=is_windows,
             checks=[
                 ("exits cleanly", lambda rc, out, err: rc == 0),
                 ("finds deployment content", lambda rc, out, err:

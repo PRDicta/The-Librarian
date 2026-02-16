@@ -540,12 +540,13 @@ def test_context_builder_chain_formatting():
 
     block = builder.build_context_block(entries, chains=chains)
 
-    # Chains should appear FIRST (before entries)
+    # Entries appear FIRST (the "what" — primary factual frame),
+    # chains appear SECOND (the "why" — supplementary narrative).
     chain_pos = block.find("REASONING CONTEXT")
     entry_pos = block.find("RETRIEVED FROM MEMORY")
     assert chain_pos >= 0, "Chain header not found in context block"
     assert entry_pos >= 0, "Entry header not found in context block"
-    assert chain_pos < entry_pos, "Chains should appear before entries"
+    assert entry_pos < chain_pos, "Entries should appear before chains (facts first, narrative second)"
 
     # Verify chain content is present
     assert "PostgreSQL over MongoDB" in block

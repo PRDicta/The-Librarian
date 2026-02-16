@@ -1220,8 +1220,18 @@ class Rolodex:
         self.conn.commit()
 
     def close(self):
-        """Close the database connection."""
+        """Close the database connection.
+
+        Forces a WAL checkpoint before closing to ensure all committed data
+        is written to the main database file. This is critical on Windows
+        where WAL files may not be properly shared between separate processes
+        (each CLI invocation opens a new connection).
+        """
         if self.conn:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass  # Non-fatal — DB may already be closed or read-only
             self.conn.close()
 # ─── Helper Functions ─────────────────────────────────────────────────────────
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
