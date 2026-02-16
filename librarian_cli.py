@@ -2733,47 +2733,22 @@ def cmd_install_gui():
     entry = tk.Entry(picker_frame, textvariable=path_var, font=(font_family, font_base - 1))
     entry.pack(side="left", fill="x", expand=True)
 
-    def _win_pick_folder(initial_dir):
-        """Use PowerShell's FolderBrowserDialog — supports 'New Folder' reliably,
-        unlike tkinter's askdirectory which uses a legacy shell dialog that can
-        crash in PyInstaller-frozen builds."""
-        try:
-            import subprocess as _sp
-            ps_script = (
-                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$f.Description = 'Select Workspace Folder'; "
-                "$f.ShowNewFolderButton = $true; "
-                f"$f.SelectedPath = '{initial_dir.replace(chr(39), chr(39)+chr(39))}'; "
-                "if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { '' }"
-            )
-            result = _sp.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=120
-            )
-            path = result.stdout.strip()
-            return path if path else None
-        except Exception:
-            return None  # Fall back to tkinter dialog
-
     def browse():
         initial = path_var.get().strip()
         if not os.path.isdir(initial):
             initial = os.path.expanduser("~")
-
-        chosen = None
-        if sys.platform == "win32":
-            chosen = _win_pick_folder(initial)
-        if chosen is None:
+        try:
             chosen = filedialog.askdirectory(initialdir=initial, title="Select Workspace Folder")
-        if chosen:
-            path_var.set(chosen)
+            if chosen:
+                path_var.set(chosen)
+        except Exception:
+            pass  # Dialog crashed (known Windows issue) — user can type path directly
 
     tk.Button(picker_frame, text="Browse...", command=browse,
               font=(font_family, font_base - 1)).pack(side="right", padx=(8, 0))
 
-    tk.Label(root, text="This is the folder you'll select in Cowork or Claude Code.\n"
-                        "The default works great for most people.",
+    tk.Label(root, text="Browse to an existing folder, or type any path below.\n"
+                        "The folder will be created automatically if it doesn't exist.",
              font=(font_family, font_base - 2), fg="#888", bg=bg).pack(pady=(4, 15))
 
     # ── Status label ──
