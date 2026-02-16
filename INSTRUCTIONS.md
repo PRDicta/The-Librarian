@@ -50,6 +50,17 @@ Skip only bare acknowledgments with zero informational content ("ok", "thanks", 
 
 Anything where past context helps: references to previous sessions, projects, people, terms, or whenever you feel you *should* know something but don't.
 
+## Temporal Grounding — Verify Before Asserting
+
+When making claims about project status, feature completeness, or the current state of anything, **check the age of the supporting evidence before asserting it as current truth.**
+
+- If a recalled entry is older than 24 hours, explicitly note its age and consider whether the claim needs reverification before presenting it as fact.
+- Prefer the pattern: *"As of [date], X was the case. Let me check if that's still current."* — then recall or check for newer entries before asserting.
+- When rating progress or status, **cite specific entries and their dates** rather than summarizing from memory. Ground every claim in retrieved evidence with a timestamp.
+- If recall results carry a `[STALE]` flag, treat them as leads to investigate, not facts to assert.
+
+The goal: never present outdated information as current truth. The Librarian timestamps everything — use those timestamps.
+
 ## Entry Hierarchy
 
 1. **User Profile** — key-value pairs (name, timezone, response_style). Loaded first at boot.
