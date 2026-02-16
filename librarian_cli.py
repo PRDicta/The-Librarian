@@ -2773,8 +2773,11 @@ def cmd_install_gui():
             os.makedirs(target, exist_ok=True)
             cmd_init(target)
 
-            # Optional: self-install to AppData + PATH (best-effort, non-blocking)
-            _self_install_to_path()
+            # NOTE: _self_install_to_path() disabled for v1.0 — it copies a
+            # second librarian.exe to AppData which confuses users who find it
+            # and double-click it (re-launches the installer GUI). The workspace
+            # is fully functional for Cowork without PATH installation.
+            # TODO: Re-enable with smarter exe behavior (CLI help vs GUI) later.
 
             status_var.set("")
             messagebox.showinfo(
