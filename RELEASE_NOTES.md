@@ -21,7 +21,7 @@ following the approach pioneered by MySQL:
 This change makes The Librarian freely available to the open-source community
 while protecting against proprietary forks that don't contribute back.
 
-See [LICENSE](plugins/the-librarian/LICENSE) and
+See [LICENSE](LICENSE) and
 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for full details.
 
 ---
