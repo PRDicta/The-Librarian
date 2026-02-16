@@ -133,7 +133,7 @@ While running, SQLite creates companion files (`rolodex.db-wal`, `rolodex.db-shm
 
 The Librarian is dual-licensed:
 
-- **Open source** — [GNU Affero General Public License v3.0 (AGPL-3.0)](plugins/the-librarian/LICENSE). Free to use, modify, and distribute under AGPL terms. If you modify the software and make it available over a network, you must release your source code under the AGPL-3.0.
+- **Open source** — [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE). Free to use, modify, and distribute under AGPL terms. If you modify the software and make it available over a network, you must release your source code under the AGPL-3.0.
 - **Commercial** — For OEMs, ISVs, SaaS providers, and enterprises that want to embed or distribute The Librarian without AGPL obligations. See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) or contact licensing@usedicta.com.
 
 Copyright (c) 2026 Dicta Technologies Inc.
