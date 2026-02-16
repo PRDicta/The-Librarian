@@ -4,6 +4,16 @@
 
 It works at the application layer, not the model layer. Ground truth is stored locally and injected at retrieval time, making it compatible with any LLM regardless of architecture.
 
+## Why this exists
+
+Every conversation with an AI starts from zero. You explain who you are, what you're working on, what you've already tried...and then the context window fills up and you start over. Three hundred sessions in, you're still introducing yourself and explaining you're not "the user". It's embarrassing.
+
+The Librarian was born from a shower thought to do better. It started as an experiment: what if it just remembered our interactions? Not through fine-tuning or retraining, but by keeping a local record of everything and surfacing the right pieces at the right time, when it was intelligently needed.
+
+I used the analogy of a well-worn book that falls open to the page you need, its spine cracked from use.
+
+And now, when I ask it to recall that analogy, it can. That's a partner, not just a forgetful genius.
+
 ## What it does
 
 The Librarian sits between you and your AI assistant, maintaining a local knowledge base that grows over time:
