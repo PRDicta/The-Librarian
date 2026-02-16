@@ -2773,11 +2773,14 @@ def cmd_install_gui():
             os.makedirs(target, exist_ok=True)
             cmd_init(target)
 
-            # NOTE: _self_install_to_path() disabled for v1.0 — it copies a
-            # second librarian.exe to AppData which confuses users who find it
-            # and double-click it (re-launches the installer GUI). The workspace
-            # is fully functional for Cowork without PATH installation.
-            # TODO: Re-enable with smarter exe behavior (CLI help vs GUI) later.
+            # Write marker so next double-click shows "already installed"
+            marker = _get_marker_path()
+            if marker:
+                try:
+                    with open(marker, "w") as f:
+                        f.write(target)
+                except Exception:
+                    pass  # Non-fatal
 
             status_var.set("")
             messagebox.showinfo(
@@ -2943,11 +2946,81 @@ async def cmd_maintain(
     close_db(lib)
 
 
+def _get_marker_path():
+    """Path to the install marker file next to the frozen exe."""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), ".librarian_installed")
+    return None
+
+
+def _show_already_installed():
+    """Show a helpful 'already installed' GUI instead of re-running setup."""
+    import tkinter as tk
+    from tkinter import messagebox
+    from src.platform_utils import get_gui_font
+
+    marker = _get_marker_path()
+    workspace = ""
+    if marker and os.path.isfile(marker):
+        try:
+            with open(marker, "r") as f:
+                workspace = f.read().strip()
+        except Exception:
+            pass
+
+    font_family, font_base = get_gui_font()
+    root = tk.Tk()
+    root.title("The Librarian")
+    root.geometry("480x280")
+    root.resizable(False, False)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - 480) // 2
+    y = (root.winfo_screenheight() - 280) // 2
+    root.geometry(f"+{x}+{y}")
+    bg = "#f5f5f5"
+    root.configure(bg=bg)
+
+    tk.Label(root, text="The Librarian", font=(font_family, font_base + 10, "bold"),
+             bg=bg).pack(pady=(25, 2))
+    tk.Label(root, text="Already Installed",
+             font=(font_family, font_base), fg="#28a745", bg=bg).pack(pady=(0, 15))
+
+    msg = "Your workspace is set up"
+    if workspace:
+        msg += f" at:\n{workspace}"
+    msg += (
+        "\n\nTo use The Librarian:\n"
+        "1. Open Cowork (in the Claude desktop app)\n"
+        "2. Click 'Select folder' and choose your workspace\n"
+        "3. Send any message — The Librarian handles the rest"
+    )
+    tk.Label(root, text=msg, font=(font_family, font_base - 1),
+             bg=bg, justify="left", wraplength=420).pack(padx=30, pady=(0, 15))
+
+    btn_frame = tk.Frame(root, bg=bg)
+    btn_frame.pack(pady=(0, 10))
+
+    def reinstall():
+        root.destroy()
+        cmd_install_gui()
+
+    tk.Button(btn_frame, text="Reinstall", command=reinstall,
+              font=(font_family, font_base - 1)).pack(side="left", padx=8)
+    tk.Button(btn_frame, text="Close", command=root.destroy,
+              font=(font_family, font_base - 1), width=10).pack(side="left", padx=8)
+
+    root.mainloop()
+
+
 async def main():
     if len(sys.argv) < 2:
         # No arguments: launch GUI installer if frozen, else show usage
         if getattr(sys, 'frozen', False):
-            cmd_install_gui()
+            marker = _get_marker_path()
+            if marker and os.path.isfile(marker):
+                _show_already_installed()
+            else:
+                cmd_install_gui()
             return
         print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|stats|end|topics|window|schema|history|init> [args]"}))
         sys.exit(1)
