@@ -27,6 +27,9 @@ class ContextBuilder:
     USER_KNOWLEDGE_HEADER = "═══ USER KNOWLEDGE ═══"
     USER_KNOWLEDGE_FOOTER = "═══ END USER KNOWLEDGE ═══"
 
+    BEHAVIORAL_HEADER = "═══ BEHAVIORAL INSTRUCTIONS ═══"
+    BEHAVIORAL_FOOTER = "═══ END BEHAVIORAL INSTRUCTIONS ═══"
+
     def build_context_block(
         self,
         entries: List[RolodexEntry],
@@ -202,6 +205,23 @@ class ContextBuilder:
             lines.append(self.SEPARATOR)
             lines.append("")
         lines.append(self.USER_KNOWLEDGE_FOOTER)
+        return "\n".join(lines)
+
+    def build_behavioral_block(self, entries: list) -> str:
+        """Format behavioral entries (compressed instructions) as a persistent context block.
+
+        These are YAML-like compressed versions of instruction documents.
+        Always loaded at boot when prompt_compression is enabled.
+        Content is rendered verbatim — it's already in compressed format.
+        """
+        if not entries:
+            return ""
+        lines = [self.BEHAVIORAL_HEADER, ""]
+        for entry in entries:
+            lines.append(entry.content)
+            lines.append(self.SEPARATOR)
+            lines.append("")
+        lines.append(self.BEHAVIORAL_FOOTER)
         return "\n".join(lines)
 
     def build_not_found_message(self, query_text: str) -> str:

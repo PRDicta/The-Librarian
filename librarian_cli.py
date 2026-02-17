@@ -340,9 +340,110 @@ def _resolve_db_path():
                 break
 
     if session_root:
+        # Restore DB from SQL dump if available (binary copies through FUSE corrupt).
+        # The sync-back process writes a SQL text dump + manifest to the mount.
+        # On boot, we rebuild from that dump instead of copying the binary DB.
+        import sqlite3 as _sqlite3
+        mount_dir = os.path.dirname(DB_PATH)
+        manifest_path = os.path.join(mount_dir, "rolodex_sync_manifest.json")
+        dump_path = os.path.join(mount_dir, "rolodex_dump.sql")
+
+        # Check if local DB has real data (not just an empty probe file).
+        # _test_sqlite_writable creates an 8KB file as a side effect, so
+        # we can't rely on file existence or size — check actual entry count.
+        local_entry_count = 0
+        if os.path.exists(session_root) and os.path.getsize(session_root) > 0:
+            try:
+                _probe = _sqlite3.connect(session_root)
+                local_entry_count = _probe.execute(
+                    "SELECT count(*) FROM rolodex_entries"
+                ).fetchone()[0]
+                _probe.close()
+            except Exception:
+                local_entry_count = 0  # table doesn't exist or DB is corrupt
+
+        should_rebuild = False
+        rebuild_reason = ""
+
+        if os.path.exists(manifest_path) and os.path.exists(dump_path):
+            try:
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                dump_size = os.path.getsize(dump_path)
+                manifest_entry_count = manifest.get("entry_count", 0)
+                # Verify dump integrity
+                if dump_size == manifest.get("dump_size", -1):
+                    import hashlib
+                    dump_hash = hashlib.md5(open(dump_path, 'rb').read()).hexdigest()
+                    if dump_hash == manifest.get("dump_md5", ""):
+                        if local_entry_count == 0:
+                            # No real data locally — rebuild from dump
+                            should_rebuild = True
+                            rebuild_reason = "no_local_data"
+                        elif manifest_entry_count > local_entry_count:
+                            # Dump has more entries — another session synced updates
+                            should_rebuild = True
+                            rebuild_reason = f"dump_has_more_entries (dump={manifest_entry_count}, local={local_entry_count})"
+                    else:
+                        print(json.dumps({"housekeeping": "dump_hash_mismatch",
+                                          "detail": f"Expected {manifest.get('dump_md5')}, got {dump_hash}"}),
+                              file=sys.stderr)
+            except (json.JSONDecodeError, IOError, OSError) as e:
+                print(json.dumps({"housekeeping": "manifest_read_failed",
+                                  "detail": str(e)}),
+                      file=sys.stderr)
+
+        if should_rebuild:
+            try:
+                # Remove stale local DB if it exists
+                if os.path.exists(session_root):
+                    os.remove(session_root)
+                # Rebuild from SQL dump
+                with open(dump_path, 'r') as f:
+                    sql = f.read()
+                db = _sqlite3.connect(session_root)
+                db.executescript(sql)
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                db.close()
+                rebuilt_size = os.path.getsize(session_root)
+                # Quick verification
+                db = _sqlite3.connect(session_root)
+                entry_count = db.execute("SELECT count(*) FROM rolodex_entries").fetchone()[0]
+                db.close()
+                print(json.dumps({"housekeeping": "db_rebuilt_from_dump",
+                                  "detail": f"Rebuilt {session_root} from {dump_path}",
+                                  "reason": rebuild_reason,
+                                  "size_bytes": rebuilt_size,
+                                  "entry_count": entry_count}),
+                      file=sys.stderr)
+            except Exception as e:
+                print(json.dumps({"housekeeping": "db_rebuild_failed",
+                                  "detail": str(e)}),
+                      file=sys.stderr)
+                # Fall through — try binary copy as last resort
+                if not (os.path.exists(session_root) and os.path.getsize(session_root) > 0):
+                    should_rebuild = False  # Let binary fallback try
+
+        # Fallback: binary copy if no dump available and no local DB
+        if not should_rebuild and local_entry_count == 0:
+            mount_available = resolved and os.path.exists(resolved) and os.path.getsize(resolved) > 0
+            if mount_available:
+                import shutil
+                try:
+                    shutil.copy2(resolved, session_root)
+                    print(json.dumps({"housekeeping": "db_auto_copy",
+                                      "detail": f"Copied {resolved} → {session_root} (binary fallback)",
+                                      "warning": "Binary copy through FUSE may corrupt — prefer SQL dump",
+                                      "size_bytes": os.path.getsize(session_root)}),
+                          file=sys.stderr)
+                except Exception as e:
+                    print(json.dumps({"housekeeping": "db_auto_copy_failed",
+                                      "detail": str(e)}),
+                          file=sys.stderr)
+
         print(json.dumps({"housekeeping": "db_fallback",
                           "detail": f"Using session-local DB at {session_root}",
-                          "warning": "DB will not persist after session ends unless copied back"}),
+                          "warning": "Changes will auto-sync back via SQL dump to mounted folder"}),
               file=sys.stderr)
         return session_root, True
 
@@ -381,6 +482,127 @@ def load_session_id():
         except (json.JSONDecodeError, IOError):
             return None
     return None
+
+
+def _sync_db_back(lib=None, force=False):
+    """Sync session-local DB back to the mounted folder via SQL dump.
+
+    Binary SQLite file copies through FUSE are unreliable — the filesystem
+    silently truncates or corrupts B-tree pages even when writes report
+    success. Instead, we dump the DB as SQL text (which FUSE handles
+    correctly for plain text files) and write a manifest so the next
+    session can rebuild from the dump.
+
+    Called at session end and periodically during ingestion.
+
+    Args:
+        lib: TheLibrarian instance (uses its _db_fallback/_db_original_path attrs)
+        force: If True, sync even if no fallback is active
+    """
+    # Accept either an instance or try to infer from global DB_PATH
+    original_path = getattr(lib, '_db_original_path', None) if lib else None
+    is_fallback = getattr(lib, '_db_fallback', False) if lib else False
+
+    if not is_fallback and not force:
+        return False
+
+    if not original_path:
+        original_path = DB_PATH
+
+    # Current working DB is the session-local one
+    session_db = lib.rolodex.db_path if lib else None
+    if not session_db or not os.path.exists(session_db):
+        return False
+
+    # Don't sync if source and dest are the same
+    if os.path.abspath(session_db) == os.path.abspath(original_path):
+        return False
+
+    try:
+        import sqlite3 as _sqlite3
+        import hashlib
+
+        # Flush any pending writes via SQLite checkpoint
+        if lib and hasattr(lib, 'rolodex') and hasattr(lib.rolodex, 'conn'):
+            try:
+                lib.rolodex.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
+        mount_dir = os.path.dirname(original_path)
+        dump_path = os.path.join(mount_dir, "rolodex_dump.sql")
+
+        # Dump DB as SQL text, stripping FTS shadow tables.
+        # SQLite's iterdump() emits CREATE TABLE + INSERT for FTS shadow
+        # tables (_config, _content, _data, _docsize, _idx), but creating
+        # the FTS virtual table auto-creates them — causing "already exists"
+        # errors on reimport. We detect FTS virtual tables, build the shadow
+        # name set, and skip any statements that reference them.
+        db = _sqlite3.connect(session_db)
+
+        # Find FTS virtual table names
+        fts_tables = set()
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%'"
+        ).fetchall():
+            fts_tables.add(row[0])
+        # Build shadow table name set
+        fts_shadow_names = set()
+        for base in fts_tables:
+            for suffix in ('_config', '_content', '_data', '_docsize', '_idx'):
+                fts_shadow_names.add(base + suffix)
+
+        with open(dump_path, 'w') as f:
+            for line in db.iterdump():
+                # Skip statements referencing FTS shadow tables
+                skip = False
+                for shadow in fts_shadow_names:
+                    # iterdump quotes table names: "tablename" or 'tablename'
+                    if f'"{shadow}"' in line or f"'{shadow}'" in line:
+                        skip = True
+                        break
+                if not skip:
+                    f.write(line + '\n')
+        db.close()
+
+        # Verify the dump landed
+        dump_size = os.path.getsize(dump_path)
+        dump_hash = hashlib.md5(open(dump_path, 'rb').read()).hexdigest()
+
+        # Write manifest so the next session knows a dump is available
+        manifest = {
+            "dump_file": "rolodex_dump.sql",
+            "dump_size": dump_size,
+            "dump_md5": dump_hash,
+            "source_session": getattr(lib, '_db_original_path', session_db),
+            "entry_count": lib.rolodex.conn.execute(
+                "SELECT count(*) FROM rolodex_entries"
+            ).fetchone()[0] if lib and hasattr(lib, 'rolodex') else -1,
+            "synced_at": __import__('datetime').datetime.utcnow().isoformat(),
+        }
+        manifest_path = os.path.join(mount_dir, "rolodex_sync_manifest.json")
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        print(json.dumps({"housekeeping": "db_sync_back",
+                          "method": "sql_dump",
+                          "detail": f"Dumped {session_db} → {dump_path}",
+                          "dump_size": dump_size,
+                          "dump_md5": dump_hash}),
+              file=sys.stderr)
+        return True
+    except Exception as e:
+        print(json.dumps({"housekeeping": "db_sync_back_failed",
+                          "detail": str(e)}),
+              file=sys.stderr)
+        return False
+
+
+# Track ingestion count for periodic sync-back
+_ingest_since_last_sync = 0
+SYNC_BACK_INTERVAL = 10  # Sync back to mount every N ingestions
 
 
 def save_session_id(session_id):
@@ -596,10 +818,18 @@ async def cmd_boot(compact=False, full_context=False):
     uk_entries = lib.rolodex.get_user_knowledge_entries()
     uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
 
-    fixed_token_cost = estimate_tokens(profile_block + uk_block)
-
-    # Serialize profile for structured access
+    # Serialize profile for structured access (needed early for compression check)
     user_profile_json = {k: v["value"] for k, v in profile.items()} if profile else {}
+
+    # Prompt compression: load behavioral entries if enabled
+    compression_enabled = user_profile_json.get('prompt_compression', '').lower() == 'on'
+    behavioral_entries = []
+    behavioral_block = ""
+    if compression_enabled:
+        behavioral_entries = lib.rolodex.get_behavioral_entries()
+        behavioral_block = cb.build_behavioral_block(behavioral_entries) if behavioral_entries else ""
+
+    fixed_token_cost = estimate_tokens(profile_block + behavioral_block + uk_block)
 
     # Phase 9: Context window state
     window_state = lib.context_window.get_state(lib.state.messages)
@@ -650,7 +880,7 @@ async def cmd_boot(compact=False, full_context=False):
     # ─── Compact boot: fast path ─────────────────────────────────────────
     if compact:
         # Return only the lightweight essentials — no manifest, no instructions
-        preamble_parts = [p for p in [profile_block, uk_block] if p]
+        preamble_parts = [p for p in [profile_block, behavioral_block, uk_block] if p]
         context_block = "\n\n".join(preamble_parts) if preamble_parts else ""
 
         output = {
@@ -662,6 +892,8 @@ async def cmd_boot(compact=False, full_context=False):
             "resumed": resumed,
             "total_entries": stats.get("total_entries", 0),
             "user_knowledge_entries": len(uk_entries),
+            "behavioral_entries": len(behavioral_entries),
+            "prompt_compression_enabled": compression_enabled,
             "past_sessions": len(past_sessions),
             "user_profile": user_profile_json,
             "embedding_strategy": embedding_strategy,
@@ -741,19 +973,19 @@ async def cmd_boot(compact=False, full_context=False):
         return
 
     # ─── Default: full boot (legacy behavior) ────────────────────────────
-    # Build final context: profile first, then user knowledge, then manifest entries
-    preamble_parts = [p for p in [profile_block, uk_block] if p]
+    # Build final context: profile first, then behavioral (if enabled), then user knowledge, then manifest
+    preamble_parts = [p for p in [profile_block, behavioral_block, uk_block] if p]
     if preamble_parts:
         context_block = "\n\n".join(preamble_parts) + "\n\n" + manifest_context if manifest_context else "\n\n".join(preamble_parts)
     else:
         context_block = manifest_context
 
     # ─── Load behavioral instructions (INSTRUCTIONS.md) ────────────────
-    # In the installed version, this file ships with the app and provides
-    # the model's behavioral contract (boot/ingest/recall protocol).
-    # This replaces the workspace CLAUDE.md — instructions are versioned
-    # with the application, not the workspace.
-    instructions_block = _load_instructions()
+    # Skip raw file if prompt compression is enabled AND behavioral entries exist.
+    # Fall back to raw file if compression is on but nothing compiled yet.
+    instructions_block = None
+    if not (compression_enabled and behavioral_entries):
+        instructions_block = _load_instructions()
 
     # ─── Version check (non-blocking, best-effort) ────────────────────
     update_info = _check_for_update()
@@ -767,6 +999,8 @@ async def cmd_boot(compact=False, full_context=False):
         "resumed": resumed,
         "total_entries": stats.get("total_entries", 0),
         "user_knowledge_entries": len(uk_entries),
+        "behavioral_entries": len(behavioral_entries),
+        "prompt_compression_enabled": compression_enabled,
         "past_sessions": len(past_sessions),
         "user_profile": user_profile_json,
         "context_block": context_block,
@@ -884,6 +1118,13 @@ async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, i
     checkpoint = window["last_checkpoint_turn"]
     if checkpoint > 0 and checkpoint % FUSE_CLEANUP_INTERVAL == 0:
         _cleanup_fuse_hidden()
+
+    # Periodic sync-back: keep mounted DB in sync during long sessions
+    global _ingest_since_last_sync
+    _ingest_since_last_sync += 1
+    if _ingest_since_last_sync >= SYNC_BACK_INTERVAL:
+        _sync_db_back(lib)
+        _ingest_since_last_sync = 0
 
     result = {
         "ingested": len(entries),
@@ -1115,6 +1356,9 @@ async def cmd_end(summary=""):
     lib.end_session(summary=summary)
     clear_session_file()
 
+    # Sync DB back to mounted folder before shutdown
+    synced = _sync_db_back(lib)
+
     # Housekeeping: clean up FUSE artifacts on session end
     _cleanup_fuse_hidden()
 
@@ -1123,6 +1367,7 @@ async def cmd_end(summary=""):
         "ended": session_id,
         "summary": summary,
         "manifest_refined": manifest_refined,
+        "db_synced_back": synced,
     }))
 
 
@@ -1515,6 +1760,9 @@ async def cmd_remember(content):
             category=_get_entry_category("user_knowledge"),
         )
 
+    # High-value write — sync back immediately
+    _sync_db_back(lib)
+
     close_db(lib)
     print(json.dumps({
         "remembered": len(entries),
@@ -1549,6 +1797,9 @@ async def cmd_correct(old_entry_id, corrected_text):
 
     # Supersede the old entry
     existed = lib.rolodex.supersede_entry(old_entry_id, new_entry.id)
+
+    # High-value write — sync back immediately
+    _sync_db_back(lib)
 
     close_db(lib)
     print(json.dumps({
@@ -1595,6 +1846,167 @@ async def cmd_profile(subcmd, args):
         print(json.dumps({"error": f"Unknown profile subcommand: {subcmd}. Use set|show|delete"}))
 
     close_db(lib)
+
+
+async def cmd_compile(content=None, file_path=None):
+    """Store compressed behavioral instructions in the rolodex.
+
+    Usage:
+      compile --content "yaml..."   # Store pre-compressed content directly
+      compile <file_path>           # Read compressed content from file
+
+    The LLM does the compression (no API key needed). This command stores
+    the result as behavioral entries, superseding any previous compilation.
+    """
+    from datetime import datetime as _dt
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="compile")
+    session_id = lib.session_id
+
+    # Input handling
+    if content:
+        compressed_text = content
+        source_file = "direct_input"
+    elif file_path:
+        if not os.path.isfile(file_path):
+            close_db(lib)
+            print(json.dumps({"error": f"File not found: {file_path}"}))
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                compressed_text = f.read()
+            source_file = os.path.basename(file_path)
+        except OSError as e:
+            close_db(lib)
+            print(json.dumps({"error": f"Failed to read file: {e}"}))
+            return
+    else:
+        close_db(lib)
+        print(json.dumps({"error": "Usage: compile --content 'yaml' or compile <file_path>"}))
+        return
+
+    from src.core.types import estimate_tokens
+    compressed_tokens = estimate_tokens(compressed_text)
+
+    # Ingest the compressed content
+    entries = await lib.ingest("assistant", compressed_text)
+
+    # Recategorize as behavioral
+    for entry in entries:
+        lib.rolodex.update_entry_enrichment(
+            entry_id=entry.id,
+            category=_get_entry_category("behavioral"),
+        )
+        # Mark as non-verbatim (it's compressed, not original prose)
+        lib.rolodex.conn.execute(
+            "UPDATE rolodex_entries SET verbatim_source = 0 WHERE id = ?",
+            (entry.id,)
+        )
+        # Store compilation metadata
+        metadata = json.dumps({
+            "source_file": source_file,
+            "compiled_at": _dt.utcnow().isoformat(),
+            "compressed_token_count": compressed_tokens,
+            "content_type": "behavioral_instructions",
+        })
+        lib.rolodex.conn.execute(
+            "UPDATE rolodex_entries SET metadata = ? WHERE id = ?",
+            (metadata, entry.id)
+        )
+    lib.rolodex.conn.commit()
+
+    # Supersede old behavioral entries
+    new_ids = {e.id for e in entries}
+    old_rows = lib.rolodex.conn.execute(
+        """SELECT id FROM rolodex_entries
+           WHERE category = 'behavioral'
+           AND superseded_by IS NULL"""
+    ).fetchall()
+    superseded = []
+    for (old_id,) in old_rows:
+        if old_id not in new_ids:
+            lib.rolodex.supersede_entry(old_id, entries[0].id if entries else old_id)
+            superseded.append(old_id)
+
+    # High-value write — sync back immediately
+    _sync_db_back(lib)
+
+    close_db(lib)
+    print(json.dumps({
+        "compiled": len(entries),
+        "entry_ids": [e.id for e in entries],
+        "source_file": source_file,
+        "compressed_tokens": compressed_tokens,
+        "superseded_entries": len(superseded),
+        "session_id": session_id,
+        "status": "ok",
+    }))
+
+
+async def cmd_settings(subcmd=None, args=None):
+    """Manage system settings and toggleable features.
+
+    Usage:
+      settings show                     # List all settings with descriptions
+      settings set <key> <value>        # Enable/disable a feature
+    """
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="settings")
+    session_id = lib.session_id
+
+    AVAILABLE_SETTINGS = {
+        "prompt_compression": {
+            "description": "Compress instruction files to YAML-like format, saving 50-70% boot tokens",
+            "options": ["on", "off"],
+            "default": "off",
+        },
+    }
+
+    if not subcmd or subcmd == "show":
+        profile = lib.rolodex.profile_get_all()
+        settings_out = {}
+        for key, meta in AVAILABLE_SETTINGS.items():
+            current = None
+            if profile and key in profile:
+                current = profile[key].get("value")
+            settings_out[key] = {
+                "description": meta["description"],
+                "options": meta["options"],
+                "current": current or meta["default"],
+                "default": meta["default"],
+            }
+        close_db(lib)
+        print(json.dumps({"settings": settings_out}, indent=2))
+
+    elif subcmd == "set":
+        if not args or len(args) < 2:
+            close_db(lib)
+            print(json.dumps({"error": "Usage: settings set <key> <value>"}))
+            return
+
+        key, value = args[0], args[1]
+        if key not in AVAILABLE_SETTINGS:
+            close_db(lib)
+            print(json.dumps({"error": f"Unknown setting: {key}. Available: {list(AVAILABLE_SETTINGS.keys())}"}))
+            return
+
+        meta = AVAILABLE_SETTINGS[key]
+        if value not in meta["options"]:
+            close_db(lib)
+            print(json.dumps({"error": f"Invalid value '{value}' for {key}. Options: {meta['options']}"}))
+            return
+
+        lib.rolodex.profile_set(key, value, session_id=session_id)
+        close_db(lib)
+        print(json.dumps({
+            "setting_changed": key,
+            "new_value": value,
+            "takes_effect": "next boot",
+        }))
+
+    else:
+        close_db(lib)
+        print(json.dumps({"error": f"Unknown subcommand: {subcmd}. Use show|set"}))
 
 
 async def cmd_window():
@@ -2737,18 +3149,15 @@ def cmd_install_gui():
         initial = path_var.get().strip()
         if not os.path.isdir(initial):
             initial = os.path.expanduser("~")
-        try:
-            chosen = filedialog.askdirectory(initialdir=initial, title="Select Workspace Folder")
-            if chosen:
-                path_var.set(chosen)
-        except Exception:
-            pass  # Dialog crashed (known Windows issue) — user can type path directly
+        chosen = filedialog.askdirectory(initialdir=initial, title="Select Workspace Folder")
+        if chosen:
+            path_var.set(chosen)
 
     tk.Button(picker_frame, text="Browse...", command=browse,
               font=(font_family, font_base - 1)).pack(side="right", padx=(8, 0))
 
-    tk.Label(root, text="Browse to an existing folder, or type any path below.\n"
-                        "The folder will be created automatically if it doesn't exist.",
+    tk.Label(root, text="This is the folder you'll select in Cowork or Claude Code.\n"
+                        "The default works great for most people.",
              font=(font_family, font_base - 2), fg="#888", bg=bg).pack(pady=(4, 15))
 
     # ── Status label ──
@@ -2773,14 +3182,8 @@ def cmd_install_gui():
             os.makedirs(target, exist_ok=True)
             cmd_init(target)
 
-            # Write marker so next double-click shows "already installed"
-            marker = _get_marker_path()
-            if marker:
-                try:
-                    with open(marker, "w") as f:
-                        f.write(target)
-                except Exception:
-                    pass  # Non-fatal
+            # Optional: self-install to AppData + PATH (best-effort, non-blocking)
+            _self_install_to_path()
 
             status_var.set("")
             messagebox.showinfo(
@@ -2946,81 +3349,11 @@ async def cmd_maintain(
     close_db(lib)
 
 
-def _get_marker_path():
-    """Path to the install marker file next to the frozen exe."""
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), ".librarian_installed")
-    return None
-
-
-def _show_already_installed():
-    """Show a helpful 'already installed' GUI instead of re-running setup."""
-    import tkinter as tk
-    from tkinter import messagebox
-    from src.platform_utils import get_gui_font
-
-    marker = _get_marker_path()
-    workspace = ""
-    if marker and os.path.isfile(marker):
-        try:
-            with open(marker, "r") as f:
-                workspace = f.read().strip()
-        except Exception:
-            pass
-
-    font_family, font_base = get_gui_font()
-    root = tk.Tk()
-    root.title("The Librarian")
-    root.geometry("480x280")
-    root.resizable(False, False)
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() - 480) // 2
-    y = (root.winfo_screenheight() - 280) // 2
-    root.geometry(f"+{x}+{y}")
-    bg = "#f5f5f5"
-    root.configure(bg=bg)
-
-    tk.Label(root, text="The Librarian", font=(font_family, font_base + 10, "bold"),
-             bg=bg).pack(pady=(25, 2))
-    tk.Label(root, text="Already Installed",
-             font=(font_family, font_base), fg="#28a745", bg=bg).pack(pady=(0, 15))
-
-    msg = "Your workspace is set up"
-    if workspace:
-        msg += f" at:\n{workspace}"
-    msg += (
-        "\n\nTo use The Librarian:\n"
-        "1. Open Cowork (in the Claude desktop app)\n"
-        "2. Click 'Select folder' and choose your workspace\n"
-        "3. Send any message — The Librarian handles the rest"
-    )
-    tk.Label(root, text=msg, font=(font_family, font_base - 1),
-             bg=bg, justify="left", wraplength=420).pack(padx=30, pady=(0, 15))
-
-    btn_frame = tk.Frame(root, bg=bg)
-    btn_frame.pack(pady=(0, 10))
-
-    def reinstall():
-        root.destroy()
-        cmd_install_gui()
-
-    tk.Button(btn_frame, text="Reinstall", command=reinstall,
-              font=(font_family, font_base - 1)).pack(side="left", padx=8)
-    tk.Button(btn_frame, text="Close", command=root.destroy,
-              font=(font_family, font_base - 1), width=10).pack(side="left", padx=8)
-
-    root.mainloop()
-
-
 async def main():
     if len(sys.argv) < 2:
         # No arguments: launch GUI installer if frozen, else show usage
         if getattr(sys, 'frozen', False):
-            marker = _get_marker_path()
-            if marker and os.path.isfile(marker):
-                _show_already_installed()
-            else:
-                cmd_install_gui()
+            cmd_install_gui()
             return
         print(json.dumps({"error": "Usage: librarian_cli.py <boot|ingest|recall|stats|end|topics|window|schema|history|init> [args]"}))
         sys.exit(1)
@@ -3249,8 +3582,28 @@ async def main():
                 force=maintain_force,
             )
 
+        elif cmd == "compile":
+            # Parse: compile --content "yaml..." OR compile <file_path>
+            compile_content = None
+            compile_file = None
+            remaining = sys.argv[2:]
+            ci = 0
+            while ci < len(remaining):
+                if remaining[ci] == "--content" and ci + 1 < len(remaining):
+                    ci += 1
+                    compile_content = remaining[ci]
+                elif not remaining[ci].startswith("--"):
+                    compile_file = remaining[ci]
+                ci += 1
+            await cmd_compile(content=compile_content, file_path=compile_file)
+
+        elif cmd == "settings":
+            subcmd = sys.argv[2] if len(sys.argv) > 2 else None
+            remaining = sys.argv[3:] if len(sys.argv) > 3 else []
+            await cmd_settings(subcmd, remaining)
+
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|compile|settings|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
             sys.exit(1)
 
     except Exception as e:

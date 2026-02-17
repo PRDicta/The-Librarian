@@ -950,6 +950,25 @@ class Rolodex:
             self._cache_put(entry)
         return entries
 
+    def get_behavioral_entries(self) -> List[RolodexEntry]:
+        """Fetch all behavioral entries (compressed instruction documents).
+
+        These are YAML-like compressed versions of CLAUDE.md / INSTRUCTIONS.md.
+        Always loaded at boot when prompt_compression is enabled, always HOT tier.
+        """
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE category = 'behavioral'
+               AND superseded_by IS NULL
+               ORDER BY created_at ASC"""
+        ).fetchall()
+        entries = [deserialize_entry(row) for row in rows]
+        # Always keep in hot cache
+        for entry in entries:
+            entry.tier = Tier.HOT
+            self._cache_put(entry)
+        return entries
+
     # ─── Entry Superseding (Corrections) ────────────────────────────
 
     def supersede_entry(self, old_entry_id: str, new_entry_id: str) -> bool:

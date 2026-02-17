@@ -39,6 +39,8 @@ class EntryCategory(Enum):
     PIVOT = "pivot"                # A change of direction or approach
     # Privileged tier — persistent user facts
     USER_KNOWLEDGE = "user_knowledge"
+    # Privileged tier — compressed behavioral instructions
+    BEHAVIORAL = "behavioral"
 class Tier(Enum):
     HOT = "hot"
     COLD = "cold"
