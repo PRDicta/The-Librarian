@@ -16,11 +16,13 @@ This workspace uses The Librarian, a persistent memory system backed by a local 
 
 ## Always-On Rules
 
-- **Every message:** Verify The Librarian is booted. If unsure, boot again.
+- **Every message (if 2+ minutes since last):** Run `pulse` first — NOT `boot`. Pulse is a sub-second heartbeat that returns `{alive, session_id, needs_boot, entry_count}`. Only boot if `needs_boot` is true (e.g. after compaction, continuation, or first message). If the user is actively chatting (under 2 minutes between messages), skip pulse — the session is clearly alive. Do NOT re-boot every message — that wastes tokens and time.
 - **Every message:** Ingest it. Both user messages and your responses, separately. See "What to Ingest" below.
 - **After compaction or continuation:** Re-boot immediately. The Librarian does not carry over.
 - **When past context would help:** Use `recall` before responding.
 - **When the user states a fact about themselves:** Use `remember` automatically. No explicit command needed from the user.
+- **When the user goes idle (5+ minutes):** Run `maintain` in the background. This improves the knowledge graph during downtime — resolving contradictions, linking orphaned corrections, merging duplicates, promoting high-value entries, and flagging stale claims.
+- **When revising a factual claim:** ALWAYS use `correct` or `--corrects` to supersede the old entry. Never just ingest a parallel entry — the old one will keep surfacing in search.
 
 ## Commands
 
@@ -37,6 +39,8 @@ All commands use the `librarian` CLI (installed to PATH).
 - `end "summary"` — Close a session with a one-line summary.
 - `window` — Check context budget.
 - `stats` — View memory system health.
+- `pulse` — Heartbeat check. Returns `{alive, session_id, needs_boot, entry_count}`. Lightweight — run every message.
+- `maintain` — Background KG hygiene. Runs 5 passes: contradiction detection, orphaned correction linking, near-duplicate merging, entry promotion, stale temporal flagging. Flags: `--budget <tokens>` (default 15000), `--cooldown <hours>` (default 4), `--force` (skip cooldown).
 
 ## What to Ingest
 
@@ -45,6 +49,8 @@ All commands use the `librarian` CLI (installed to PATH).
 Ingest every user message and every assistant response, verbatim. Storage is trivial for a local hard drive. Lossy ingestion is worse than a large corpus — the search layer (user_knowledge boost, categories, ranking) handles surfacing the right things. Cherry-picking at ingestion time loses context that may matter later.
 
 Skip only bare acknowledgments with zero informational content ("ok", "thanks", "got it").
+
+**CRITICAL — Verbatim means verbatim.** When calling `ingest user "..."` or `ingest assistant "..."`, paste the EXACT text of the message. Do NOT summarize, paraphrase, condense, or rewrite. Copy the raw message text and pass it directly. The ingestion pipeline handles categorization, tagging, and embedding — your job is to pass through the original words unchanged. If the message is long, that's fine — ingest it in full. Summaries lose the specific phrasing, negative constraints, and decision rationale that make entries useful in search later.
 
 ## What to Recall
 

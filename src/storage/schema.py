@@ -245,17 +245,57 @@ CREATE INDEX IF NOT EXISTS idx_manifest_entries_entry
     ON manifest_entries(entry_id);
 """
 # ─── Database Initialization ─────────────────────────────────────────────────
+def _is_fuse_mount(path: Path) -> bool:
+    """Detect if a path is on a FUSE filesystem.
+
+    Cowork mounts the user's folder into its Linux VM via FUSE.
+    SQLite WAL mode relies on shared-memory locking (mmap) which
+    FUSE doesn't support, causing the DB to fall back to a temp
+    path that gets wiped between sessions.
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["stat", "-f", "-c", "%T", str(path.parent)],
+            capture_output=True, text=True, timeout=2
+        )
+        fs_type = result.stdout.strip().lower()
+        return "fuse" in fs_type
+    except Exception:
+        # Fallback: check /proc/mounts on Linux
+        try:
+            mounts = Path("/proc/mounts").read_text()
+            path_str = str(path.resolve())
+            for line in mounts.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and path_str.startswith(parts[1]):
+                    if "fuse" in parts[2].lower():
+                        return True
+        except Exception:
+            pass
+    return False
+
+
 def init_database(db_path: str) -> sqlite3.Connection:
     """
     Create database and tables if they don't exist.
     Returns an open connection.
+
+    On FUSE filesystems (e.g. Cowork's VM mount), uses journal_mode=OFF
+    instead of WAL because FUSE doesn't support the shared-memory locking
+    that WAL requires. This trades crash-recovery journaling for actually
+    persisting data on disk across sessions.
     """
     # Ensure directory exists
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")      # Better concurrent read/write
+    # FUSE doesn't support WAL's shared-memory locking — use OFF instead
+    if _is_fuse_mount(path):
+        conn.execute("PRAGMA journal_mode=OFF")
+    else:
+        conn.execute("PRAGMA journal_mode=WAL")      # Better concurrent read/write
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
