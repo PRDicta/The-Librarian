@@ -31,7 +31,7 @@ See [LICENSE](LICENSE) and
 
 **License: Dual-licensed under AGPL-3.0 + Commercial**
 
-Persistent memory for AI assistants — first production release.
+Persistent memory for Cowork — first production release.
 
 ### Features
 
