@@ -1,8 +1,8 @@
 # The Librarian
 
-**Persistent memory for AI assistants.** The Librarian gives language models perfect recall across conversations — preferences, decisions, project context, and past discussions survive between sessions.
+**Persistent memory for Cowork.** The Librarian gives Claude perfect recall across conversations — preferences, decisions, project context, and past discussions survive between sessions.
 
-It works at the application layer, not the model layer. Ground truth is stored locally and injected at retrieval time, making it compatible with any LLM regardless of architecture.
+Built for Claude on Cowork (Anthropic's desktop app). Ground truth is stored locally and injected at retrieval time via a CLI interface. The architecture is LLM-agnostic in principle — but Cowork is the tested and supported environment.
 
 If The Librarian was useful to you, please consider [buying me a drink](https://buymeacoffee.com/chief_librarian).
 
@@ -12,21 +12,21 @@ Every conversation with an AI starts from zero. You explain who you are, what yo
 
 The Librarian was born from a shower thought to do better. It started as an experiment: what if it just remembered our interactions? Not through fine-tuning or retraining, but by keeping a local record of everything and surfacing the right pieces at the right time, when it was intelligently needed.
 
-I used the analogy of a well-worn book that falls open to the page you need, its spine cracked from use.
-
-And now, when I ask it to recall that analogy, it can. That's a partner, not just a forgetful genius.
+I used the analogy of a well-worn book that falls open to the page you need, its spine cracked from use. And now, when I ask it to recall that analogy, it can.
 
 ## What it does
 
-The Librarian sits between you and your AI assistant, maintaining a local knowledge base that grows over time:
+**Tested on:** Claude Opus 4.6 (Anthropic, February 2026) via Cowork on Windows and macOS.
+
+The Librarian sits between you and Claude in Cowork, maintaining a local knowledge base that grows over time:
 
 - **Conversation memory** — Every substantive exchange is indexed. Preferences, decisions, code patterns, and project facts persist across sessions automatically.
 - **Hybrid search** — Combines FTS5 keyword matching with ONNX-accelerated semantic embeddings (all-MiniLM-L6-v2) for accurate retrieval. Query expansion and multi-signal reranking surface the right context.
 - **Three-tier storage** — Active context stays lean. Frequently accessed entries are promoted to a hot cache. Everything else lives in cold storage, retrieved on demand.
 - **User knowledge** — Facts about the user (preferences, corrections, biographical context) get a permanent 3x search boost and are loaded at every boot.
 - **Context window management** — Automatically tracks token budgets and offloads content to the rolodex before context overflows.
-- **Temporal grounding** — Timestamps everything and flags stale entries, so the assistant never presents outdated information as current truth.
-- **Dual mode** — Works out of the box in verbatim mode (no API key needed), or with an Anthropic API key for enhanced extraction and enrichment.
+- **Temporal grounding** — Timestamps everything and flags stale entries, so Claude never presents outdated information as current truth.
+- **Dual mode** — Works out of the box in verbatim mode (no API key needed), or with an Anthropic API key for enhanced extraction and enrichment (tested with Claude models).
 
 ## Installation
 
@@ -72,6 +72,22 @@ librarian recall "<query>" --fresh [hours]   # Prioritize recent entries
 
 ## How it works
 
+```
+┌────────────────┐    ┌───────────────────────────────┐
+│  Cowork (CLI)  │────│  The Librarian                │
+│  boot / recall │    │                               │
+│  ingest / pulse│    │  FTS5 keyword search           │
+└────────────────┘    │  + ONNX semantic embeddings    │
+                      │  + multi-signal reranking      │
+                      │                               │
+                      │  ┌─────────────────────────┐  │
+                      │  │  rolodex.db (SQLite)    │  │
+                      │  │  entries + embeddings   │  │
+                      │  │  user knowledge + KG    │  │
+                      │  └─────────────────────────┘  │
+                      └───────────────────────────────┘
+```
+
 ### Storage
 
 All data lives in a single SQLite database (`rolodex.db`) in your project directory. No external servers, no cloud dependencies. The database uses WAL mode for concurrent read/write safety.
@@ -91,7 +107,15 @@ The Librarian bundles an ONNX-optimized all-MiniLM-L6-v2 model (~25MB) for local
 
 ### Reasoning chains
 
-When the assistant's thinking process matters (design decisions, debugging sessions, multi-step analyses), The Librarian captures reasoning chains — ordered sequences of steps that preserve the "why" alongside the "what."
+When Claude's thinking process matters (design decisions, debugging sessions, multi-step analyses), The Librarian captures reasoning chains — ordered sequences of steps that preserve the "why" alongside the "what."
+
+## Limitations and known scope
+
+- **Single model family tested.** The Librarian has been developed and tested exclusively with Claude (Anthropic) via Cowork. Behavior with other LLMs is untested.
+- **Single platform tested.** Cowork is the only verified integration surface. The CLI architecture is portable, but no other platform has been validated.
+- **English-only embeddings.** The bundled ONNX model (all-MiniLM-L6-v2) is optimized for English. Recall quality for other languages will be lower.
+- **Single-user.** The rolodex is designed for one person's workflow. There is no multi-user, permissioning, or shared-memory support.
+- **No encryption at rest.** The SQLite database is stored in plaintext. Sensitive data should be managed accordingly.
 
 ## Building from source
 
