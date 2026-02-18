@@ -1056,6 +1056,8 @@ async def cmd_boot(compact=False, full_context=False):
     if instructions_block:
         output["instructions"] = instructions_block
     if update_info:
+        update_info["current_version"] = __version__
+        update_info["apply_command"] = "update"
         output["update_available"] = update_info
 
     # Housekeeping: clean up FUSE artifacts on every boot
@@ -3620,6 +3622,323 @@ async def cmd_history(subcmd, args):
     conn.close()
 
 
+def cmd_update(args):
+    """Self-update The Librarian from GitHub or a local source directory.
+
+    Two modes:
+      Network: Downloads files from raw.githubusercontent.com (works on native machine)
+      Local:   Copies from a local source directory (works in Cowork VM via --source)
+
+    Preserves user data (rolodex.db, vocab_packs/, CLAUDE.md, .env).
+    Creates .bak backups for rollback on failure.
+
+    Flags:
+        --check           Just check for updates, don't apply
+        --force           Skip version check, re-download/copy everything
+        --rollback        Restore from .bak files if they exist
+        --source <dir>    Copy from local librarian directory instead of downloading
+        --target <dir>    Update a different librarian directory (default: self)
+    """
+    import shutil
+
+    librarian_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Parse flags
+    check_only = "--check" in args
+    force = "--force" in args
+    rollback = "--rollback" in args
+    source_dir = None
+    target_dir = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--source" and i + 1 < len(args):
+            i += 1
+            source_dir = args[i]
+        elif args[i] == "--target" and i + 1 < len(args):
+            i += 1
+            target_dir = args[i]
+        i += 1
+
+    # Target defaults to self (where this script lives)
+    if target_dir:
+        target = os.path.abspath(target_dir)
+    else:
+        target = librarian_dir
+
+    # ─── Rollback mode ────────────────────────────────────────────────
+    if rollback:
+        restored = []
+        roll_failed = []
+        for root, dirs, files in os.walk(target):
+            for f in files:
+                if f.endswith(".bak"):
+                    bak_path = os.path.join(root, f)
+                    orig_path = bak_path[:-4]  # strip .bak
+                    try:
+                        shutil.copy2(bak_path, orig_path)
+                        os.remove(bak_path)
+                        restored.append(os.path.relpath(orig_path, target))
+                    except Exception as e:
+                        roll_failed.append({"file": os.path.relpath(orig_path, target), "error": str(e)})
+        print(json.dumps({
+            "status": "rolled_back" if restored else "no_backups",
+            "restored": restored,
+            "failed": roll_failed,
+        }))
+        return
+
+    # ─── Version comparison ───────────────────────────────────────────
+    # Read target's current version
+    target_version = __version__
+    target_version_file = os.path.join(target, "src", "__version__.py")
+    if os.path.isfile(target_version_file):
+        try:
+            with open(target_version_file, "r") as f:
+                for line in f:
+                    if line.startswith("__version__"):
+                        target_version = line.split("=")[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+
+    # If using local source, compare versions directly
+    if source_dir:
+        source = os.path.abspath(source_dir)
+        source_version = None
+        sv_file = os.path.join(source, "src", "__version__.py")
+        if os.path.isfile(sv_file):
+            try:
+                with open(sv_file, "r") as f:
+                    for line in f:
+                        if line.startswith("__version__"):
+                            source_version = line.split("=")[1].strip().strip('"').strip("'")
+                            break
+            except Exception:
+                pass
+
+        if not force and source_version and source_version == target_version:
+            print(json.dumps({
+                "status": "current",
+                "version": target_version,
+                "source_version": source_version,
+                "message": f"Target is already at v{target_version} (same as source)."
+            }))
+            return
+
+        if check_only:
+            print(json.dumps({
+                "status": "update_available" if source_version != target_version else "current",
+                "current_version": target_version,
+                "source_version": source_version or "unknown",
+                "message": f"Source has v{source_version}, target has v{target_version}.",
+            }))
+            return
+    else:
+        # Network mode: check GitHub
+        if not force:
+            update_info = _check_for_update()
+            if not update_info:
+                print(json.dumps({
+                    "status": "current",
+                    "version": target_version,
+                    "message": f"The Librarian v{target_version} is already up to date (or GitHub unreachable)."
+                }))
+                return
+        else:
+            update_info = {"latest_version": "forced", "message": "Force re-download requested."}
+
+        if check_only:
+            print(json.dumps({
+                "status": "update_available",
+                "current_version": target_version,
+                **(update_info or {}),
+            }))
+            return
+
+    # ─── Load manifest ────────────────────────────────────────────────
+    manifest = None
+
+    # Try source directory manifest first
+    if source_dir:
+        src_manifest = os.path.join(source, "source_manifest.json")
+        if os.path.isfile(src_manifest):
+            with open(src_manifest, "r") as f:
+                manifest = json.load(f)
+
+    # Try network manifest
+    if not manifest and not source_dir:
+        import urllib.request
+        RAW_BASE = "https://raw.githubusercontent.com/PRDicta/The-Librarian/main/librarian"
+        try:
+            req = urllib.request.Request(
+                f"{RAW_BASE}/source_manifest.json",
+                headers={"User-Agent": "TheLibrarian/" + __version__}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                manifest = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            pass
+
+    # Fall back to local manifest
+    if not manifest:
+        local_manifest = os.path.join(target, "source_manifest.json")
+        if os.path.isfile(local_manifest):
+            with open(local_manifest, "r") as f:
+                manifest = json.load(f)
+
+    if not manifest or not manifest.get("files"):
+        print(json.dumps({"status": "error", "error": "No manifest available (network unreachable, no local copy)."}))
+        return
+
+    file_list = manifest["files"]
+
+    # ─── Backup current target files ──────────────────────────────────
+    backed_up = []
+    for rel_path in file_list:
+        dest = os.path.join(target, rel_path)
+        if os.path.isfile(dest):
+            bak = dest + ".bak"
+            try:
+                shutil.copy2(dest, bak)
+                backed_up.append(rel_path)
+            except Exception:
+                pass
+
+    # ─── Copy/download files ──────────────────────────────────────────
+    updated = []
+    failed = []
+
+    if source_dir:
+        # Local copy mode
+        for rel_path in file_list:
+            src_file = os.path.join(source, rel_path)
+            dest_file = os.path.join(target, rel_path)
+
+            if not os.path.isfile(src_file):
+                failed.append({"file": rel_path, "error": "Not found in source"})
+                continue
+
+            dest_parent = os.path.dirname(dest_file)
+            if dest_parent:
+                os.makedirs(dest_parent, exist_ok=True)
+
+            try:
+                shutil.copy2(src_file, dest_file)
+                updated.append(rel_path)
+            except Exception as e:
+                failed.append({"file": rel_path, "error": str(e)})
+    else:
+        # Network download mode
+        import urllib.request
+        RAW_BASE = "https://raw.githubusercontent.com/PRDicta/The-Librarian/main/librarian"
+        for rel_path in file_list:
+            url = f"{RAW_BASE}/{rel_path}"
+            dest_file = os.path.join(target, rel_path)
+
+            dest_parent = os.path.dirname(dest_file)
+            if dest_parent:
+                os.makedirs(dest_parent, exist_ok=True)
+
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "TheLibrarian/" + __version__})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    content = resp.read()
+
+                tmp_path = dest_file + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+
+                if os.path.exists(dest_file):
+                    os.remove(dest_file)
+                os.rename(tmp_path, dest_file)
+                updated.append(rel_path)
+            except Exception as e:
+                failed.append({"file": rel_path, "error": str(e)})
+                tmp_path = dest_file + ".tmp"
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+    # ─── Verify update ────────────────────────────────────────────────
+    verify_ok = True
+    verify_errors = []
+    new_version = target_version
+
+    if updated:
+        # Re-read the new __version__
+        nv_file = os.path.join(target, "src", "__version__.py")
+        if os.path.isfile(nv_file):
+            try:
+                with open(nv_file, "r") as f:
+                    for line in f:
+                        if line.startswith("__version__"):
+                            new_version = line.split("=")[1].strip().strip('"').strip("'")
+                            break
+            except Exception:
+                pass
+
+        # Verify key modules compile cleanly
+        try:
+            for mod_rel in ["src/core/types.py", "src/storage/schema.py", "src/storage/rolodex.py"]:
+                fpath = os.path.join(target, mod_rel)
+                if os.path.isfile(fpath):
+                    with open(fpath, "r") as f:
+                        compile(f.read(), fpath, "exec")
+        except SyntaxError as e:
+            verify_ok = False
+            verify_errors.append(f"Syntax error in {e.filename}: {e.msg}")
+        except Exception as e:
+            verify_errors.append(f"Verification warning: {e}")
+
+    # ─── Rollback on failure ──────────────────────────────────────────
+    if not verify_ok:
+        rolled_back = []
+        for rel_path in backed_up:
+            bak = os.path.join(target, rel_path) + ".bak"
+            orig = os.path.join(target, rel_path)
+            if os.path.isfile(bak):
+                try:
+                    shutil.copy2(bak, orig)
+                    os.remove(bak)
+                    rolled_back.append(rel_path)
+                except Exception:
+                    pass
+        print(json.dumps({
+            "status": "error",
+            "error": "Update failed verification — rolled back.",
+            "verify_errors": verify_errors,
+            "rolled_back": rolled_back,
+        }))
+        return
+
+    # ─── Clean up backups on success ──────────────────────────────────
+    for rel_path in backed_up:
+        bak = os.path.join(target, rel_path) + ".bak"
+        try:
+            if os.path.isfile(bak):
+                os.remove(bak)
+        except Exception:
+            pass
+
+    # ─── Report ───────────────────────────────────────────────────────
+    print(json.dumps({
+        "status": "updated",
+        "previous_version": target_version,
+        "new_version": new_version,
+        "files_updated": len(updated),
+        "files_failed": len(failed),
+        "updated_files": updated,
+        "failed_files": failed,
+        "verify_warnings": verify_errors,
+        "source": source_dir or "github",
+        "target": target,
+        "message": f"Updated from v{target_version} to v{new_version}. Please re-boot The Librarian to load new code.",
+    }))
+
+
 def cmd_init(target_dir):
     """Initialize a workspace folder for Cowork use.
 
@@ -4387,6 +4706,11 @@ async def main():
             args = sys.argv[3:] if len(sys.argv) > 3 else []
             await cmd_projects(subcmd, args)
 
+        elif cmd == "update":
+            update_args = sys.argv[2:]
+            cmd_update(update_args)
+            return
+
         elif cmd == "init":
             if len(sys.argv) < 3:
                 print(json.dumps({"error": "Usage: librarian_cli.py init <target_folder>"}))
@@ -4478,7 +4802,7 @@ async def main():
             await cmd_codebook(subcmd, remaining)
 
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|compile|settings|codebook|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|compile|settings|codebook|update|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
             sys.exit(1)
 
     except Exception as e:
