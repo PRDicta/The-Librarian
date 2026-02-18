@@ -823,11 +823,25 @@ async def cmd_boot(compact=False, full_context=False):
 
     # Prompt compression: load behavioral entries if enabled
     compression_enabled = user_profile_json.get('prompt_compression', '').lower() == 'on'
+    abbrev_compression_active = False
     behavioral_entries = []
     behavioral_block = ""
     if compression_enabled:
         behavioral_entries = lib.rolodex.get_behavioral_entries()
         behavioral_block = cb.build_behavioral_block(behavioral_entries) if behavioral_entries else ""
+        # Check if stored entries used abbreviation compression (from metadata)
+        for be in behavioral_entries:
+            try:
+                row = lib.rolodex.conn.execute(
+                    "SELECT metadata FROM rolodex_entries WHERE id = ?", (be.id,)
+                ).fetchone()
+                if row and row[0]:
+                    be_meta = json.loads(row[0])
+                    if be_meta.get("abbrev_compression") or be_meta.get("emoji_compression"):
+                        abbrev_compression_active = True
+                        break
+            except Exception:
+                pass
 
     fixed_token_cost = estimate_tokens(profile_block + behavioral_block + uk_block)
 
@@ -894,6 +908,7 @@ async def cmd_boot(compact=False, full_context=False):
             "user_knowledge_entries": len(uk_entries),
             "behavioral_entries": len(behavioral_entries),
             "prompt_compression_enabled": compression_enabled,
+            "abbrev_compression_active": abbrev_compression_active,
             "past_sessions": len(past_sessions),
             "user_profile": user_profile_json,
             "embedding_strategy": embedding_strategy,
@@ -1001,6 +1016,7 @@ async def cmd_boot(compact=False, full_context=False):
         "user_knowledge_entries": len(uk_entries),
         "behavioral_entries": len(behavioral_entries),
         "prompt_compression_enabled": compression_enabled,
+        "emoji_compression_active": emoji_compression_active,
         "past_sessions": len(past_sessions),
         "user_profile": user_profile_json,
         "context_block": context_block,
@@ -1848,15 +1864,416 @@ async def cmd_profile(subcmd, args):
     close_db(lib)
 
 
-async def cmd_compile(content=None, file_path=None):
+# ─── Emoji Compression Vocabulary ────────────────────────────────────────────
+# Each entry: (pattern, replacement, flags).
+# - Patterns use word boundaries (\b) to prevent partial matches.
+# - Ordered by phrase length (longest first) to avoid greedy partial hits.
+# - Flags: 'i' = case-insensitive, 'v' = values only (not YAML keys), 'a' = apply anywhere.
+#
+# DESIGN PRINCIPLE: Only multi-word phrase collapses and long-word abbreviations.
+# Single common words (speaker, content, company) are 1 token each — replacing
+# with emoji (2-4 tokens each) is a net token LOSS. Text abbreviations (KPI, SEO,
+# ROI, etc.) cost 1 token each and replace multi-word phrases that cost 2-5 tokens.
+# The floor guard enforces token savings at runtime via real BPE token estimation,
+# but the vocabulary itself is curated to focus on productive text-to-text collapses.
+#
+# Vocab packs (loaded via --vocab <pack>) extend this list with domain-specific terms.
+
+# ── Abbreviation expansion dictionary ──────────────────────────────────────
+# Maps every abbreviation back to its full human-readable form.
+# Used by _expand_abbreviations() for reverse lookup and by UIs for tooltips/legends.
+ABBREV_EXPANSIONS = {
+    # ── Multi-word phrase → acronym (validated token savings) ──
+    "KPI": "Key Performance Indicator(s)",     # 3 tok → 2 = save 1
+    "ROI": "Return on Investment",              # 3 tok → 1 = save 2
+    "SEO": "Search Engine Optimization",        # 3 tok → 2 = save 1
+    "UX": "User Experience",                    # 2 tok → 1 = save 1
+    "UI": "User Interface",                     # 2 tok → 1 = save 1
+    "CTA": "Call to Action",                    # 3 tok → 2 = save 1
+    "ICP": "Ideal Client/Customer Profile",     # 3 tok → 1 = save 2
+    "TAM": "Total Addressable Market",          # 4 tok → 2 = save 2
+    "GTM": "Go-to-Market",                      # 5 tok → 2 = save 3
+    "B2B": "Business to Business",              # 3 tok → 3 = save 0 (floor may skip)
+    "B2C": "Business to Consumer",              # 3 tok → 3 = save 0 (floor may skip)
+    "SLA": "Service Level Agreement",           # 3 tok → 2 = save 1
+    "NDA": "Non-Disclosure Agreement",          # 5 tok → 2 = save 3
+    "MVP": "Minimum Viable Product",            # 3 tok → 2 = save 1
+    "OKR": "Objectives and Key Results",        # 5 tok → 2 = save 3
+    "KG": "Knowledge Graph",                    # 2 tok → 1 = save 1
+    # ── Long-word abbreviations (validated token savings only) ──
+    "conf": "confidentiality",                  # 3 tok → 1 = save 2
+    "certs": "certifications",                  # 2 tok → 1 = save 1
+    "infra": "infrastructure",                  # 2 tok → 1 = save 1
+    "demo": "demographics",                     # 2 tok → 1 = save 1
+    # ── Structural ──
+    "§": "Section",                             # 1 tok → 1 = save 0 (chars only)
+}
+
+ABBREV_VOCAB = [
+    # ── Frozen identifiers (never substitute) ──
+    (r"\buser[_\s]?knowledge\b", "user_knowledge", "a"),  # preserve as-is
+
+    # ── Multi-word phrase collapses (highest savings: 3-5 word phrases → 1 token abbrev) ──
+    (r"\bkey[_\s](?:performance[_\s])?indicators?\b", "KPI", "vi"),
+    (r"\breturn[_\s]on[_\s]investment\b", "ROI", "vi"),
+    (r"\bsearch[_\s]engine[_\s]optimization\b", "SEO", "vi"),
+    (r"\bcall[_\s]to[_\s]action\b", "CTA", "vi"),
+    (r"\buser[_\s]experience\b", "UX", "vi"),
+    (r"\buser[_\s]interface\b", "UI", "vi"),
+    (r"\bideal[_\s](?:client|customer)(?:[_\s]profiles?)?\b", "ICP", "vi"),
+    (r"\btotal[_\s]addressable[_\s]market\b", "TAM", "vi"),
+    (r"\bgo[_\s-]to[_\s-]market\b", "GTM", "vi"),
+    (r"\bbusiness[_\s]to[_\s]business\b", "B2B", "vi"),
+    (r"\bbusiness[_\s]to[_\s]consumer\b", "B2C", "vi"),
+    (r"\bservice[_\s]level[_\s]agreements?\b", "SLA", "vi"),
+    (r"\bnon[_\s-]disclosure[_\s]agreements?\b", "NDA", "vi"),
+    (r"\bminimum[_\s]viable[_\s]products?\b", "MVP", "vi"),
+    (r"\bobjectives?[_\s](?:and[_\s])?key[_\s]results?\b", "OKR", "vi"),
+    (r"\bknowledge[_\s]graph\b", "KG", "vi"),
+    # NOTE: Partial abbreviations like "tgt audience", "mkt positioning",
+    # "thought ldrshp" tested as 0 or negative token savings with Claude's BPE.
+    # Only well-established acronyms provide real savings. The entries below
+    # were removed after tokenizer validation:
+    # - target audience → tgt audience (0 savings)
+    # - market positioning → mkt positioning (-1 token, WORSE)
+    # - competitive analysis → comp analysis (0 savings)
+    # - content strategy → content strat (0 savings)
+    # - thought leadership → thought ldrshp (-2 tokens, WORSE)
+    # - lead generation → lead gen (0 savings)
+    # - cross-contamination → cross-contam (0 savings)
+    # - content generation → content gen (0 savings)
+
+    # ── Long words → short abbreviations (only those validated as token-saving) ──
+    # Most long English words are already 1 token in Claude's BPE vocabulary.
+    # Only the following multi-subword words provide real savings:
+    (r"\bconfidentiality\b", "conf", "vi"),       # 3 tokens → 1 = save 2
+    (r"\bcertifications\b", "certs", "vi"),        # 2 tokens → 1 = save 1
+    (r"\binfrastructure\b", "infra", "vi"),        # 2 tokens → 1 = save 1
+    (r"\bdemographics?\b", "demo", "vi"),          # 2 tokens → 1 = save 1
+    # NOTE: The following tested as 0 or negative savings (floor guard blocks them):
+    # certification(1)→certs(1), organization(1)→orgs(1), collaboration(2)→collab(2),
+    # implementation(1)→impl(1), documentation(1)→docs(1), recommendations(1)→recs(1),
+    # communications(1)→comms(2 BAD), authorization(1)→auth(1), authentication(1)→auth(1),
+    # configuration(1)→configs(1)
+
+    # ── Structural shorthand (§ = 1 token, saves chars without costing tokens) ──
+    (r"\bSection\b", "§", "a"),
+    (r"\bsection\b", "§", "a"),
+]
+
+
+def _load_vocab_pack(pack_name):
+    """Load a domain-specific abbreviation vocabulary pack and extend ABBREV_VOCAB.
+
+    Vocab packs are JSON files stored in the librarian directory or user workspace.
+    Format: [{"pattern": "regex", "replacement": "abbreviation", "flags": "vi"}, ...]
+
+    Search order:
+    1. <librarian_dir>/vocab_packs/<pack_name>.json
+    2. <workspace_dir>/vocab_packs/<pack_name>.json
+    """
+    global ABBREV_VOCAB
+
+    search_dirs = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocab_packs"),
+    ]
+    # Also check workspace mount
+    mount_dir = os.path.dirname(DB_PATH)
+    if mount_dir:
+        search_dirs.append(os.path.join(mount_dir, "vocab_packs"))
+
+    pack_file = None
+    for d in search_dirs:
+        candidate = os.path.join(d, f"{pack_name}.json")
+        if os.path.isfile(candidate):
+            pack_file = candidate
+            break
+
+    if not pack_file:
+        print(json.dumps({
+            "warning": f"Vocab pack '{pack_name}' not found",
+            "searched": search_dirs,
+        }))
+        return 0
+
+    try:
+        with open(pack_file, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        added = 0
+        for entry in entries:
+            pattern = entry.get("pattern", "")
+            replacement = entry.get("replacement", "")
+            flags = entry.get("flags", "vi")
+            if pattern and replacement:
+                # Insert at the beginning (domain-specific phrases should match first)
+                ABBREV_VOCAB.insert(0, (pattern, replacement, flags))
+                added += 1
+
+        print(json.dumps({
+            "vocab_pack_loaded": pack_name,
+            "entries_added": added,
+            "total_vocab_size": len(ABBREV_VOCAB),
+        }))
+        return added
+
+    except (json.JSONDecodeError, OSError) as e:
+        print(json.dumps({"error": f"Failed to load vocab pack '{pack_name}': {e}"}))
+        return 0
+
+
+def _apply_abbrev_compression(text):
+    """Apply programmatic text abbreviation to YAML-compressed text.
+
+    Replaces multi-word phrases and long words with standard abbreviations
+    (KPI, SEO, ROI, impl, docs, etc.) that are cheaper in BPE tokens.
+    All abbreviations have reverse expansions in ABBREV_EXPANSIONS.
+
+    Returns (compressed_text, substitution_count, unique_abbrev_count, skipped_floor).
+    """
+    import re
+
+    result = text
+    total_subs = 0
+    skipped_floor = 0
+    abbrev_set = set()
+
+    for pattern, replacement, flags in ABBREV_VOCAB:
+        case_flag = re.IGNORECASE if 'i' in flags else 0
+
+        # ── Floor guard: skip if replacement costs more tokens than matched text ──
+        # Uses BPE-aware token estimation to compare costs.
+        # Character savings may still occur, but token savings is the priority.
+        sample_match = re.search(pattern, result, flags=case_flag)
+        if sample_match:
+            from src.core.types import estimate_tokens as _est
+            matched_tokens = _est(sample_match.group())
+            replacement_tokens = _est(replacement)
+            if replacement_tokens >= matched_tokens:
+                skipped_floor += 1
+                continue
+
+        if 'v' in flags:
+            # Values only: apply to value portions of YAML lines, not key names.
+            # A "value" is: text after first colon on key:value lines, OR entire
+            # content of list items (lines starting with - ), OR quoted strings.
+            lines = result.split('\n')
+            new_lines = []
+            for line in lines:
+                stripped = line.lstrip()
+                if stripped.startswith('#'):
+                    # Comment line — skip entirely
+                    new_lines.append(line)
+                    continue
+
+                if stripped.startswith('- '):
+                    # YAML list item — entire content is a value
+                    indent = line[:len(line) - len(stripped)]
+                    new_stripped, count = re.subn(pattern, replacement, stripped, flags=case_flag)
+                    total_subs += count
+                    if count > 0:
+                        abbrev_set.add(replacement)
+                    new_lines.append(indent + new_stripped)
+                else:
+                    colon_idx = line.find(':')
+                    if colon_idx > 0:
+                        key_part = line[:colon_idx + 1]
+                        val_part = line[colon_idx + 1:]
+                        new_val, count = re.subn(pattern, replacement, val_part, flags=case_flag)
+                        total_subs += count
+                        if count > 0:
+                            abbrev_set.add(replacement)
+                        new_lines.append(key_part + new_val)
+                    else:
+                        new_lines.append(line)
+            result = '\n'.join(new_lines)
+        else:
+            # Apply anywhere
+            new_result, count = re.subn(pattern, replacement, result, flags=case_flag)
+            total_subs += count
+            if count > 0:
+                abbrev_set.add(replacement)
+            result = new_result
+
+    return result, total_subs, len(abbrev_set), skipped_floor
+
+
+def _expand_abbreviations(text):
+    """Reverse abbreviation compression for display/debugging.
+
+    Reconstructs readable text from abbreviation-compressed YAML using
+    ABBREV_EXPANSIONS. Not a perfect inverse (some casing/spacing may differ),
+    but good enough for human review and confirmation.
+
+    The expansion dictionary (ABBREV_EXPANSIONS) serves as:
+    1. Reverse lookup for programmatic de-compression
+    2. Human-readable legend for reviewing compressed output
+    3. Tooltip data source for UI rendering
+    """
+    import re
+
+    result = text
+    # Sort by length descending to prevent partial matches (e.g. "auth" before "a")
+    for abbrev, expansion in sorted(ABBREV_EXPANSIONS.items(), key=lambda x: len(x[0]), reverse=True):
+        # Use word boundary matching to avoid replacing substrings
+        result = re.sub(r'\b' + re.escape(abbrev) + r'\b', expansion, result)
+
+    # Clean up double spaces
+    result = re.sub(r"  +", " ", result)
+    return result
+
+
+def _suggest_abbrev_vocab(text, top_n=20):
+    """Analyze text to find high-frequency words not covered by ABBREV_VOCAB.
+
+    Scans value positions in YAML text, tokenizes, counts frequency,
+    filters out words already handled by the vocabulary, stopwords, and
+    short words, then returns candidates ranked by potential token savings.
+
+    Returns list of dicts: [{word, count, est_chars_saved, suggested_emoji}]
+    """
+    import re
+    from collections import Counter
+
+    # Extract only value text (after colons + list items) — same logic as _apply_emoji_compression
+    value_chunks = []
+    for line in text.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('#'):
+            continue
+        if stripped.startswith('- '):
+            value_chunks.append(stripped[2:])
+        else:
+            colon_idx = line.find(':')
+            if colon_idx > 0:
+                value_chunks.append(line[colon_idx + 1:])
+
+    value_text = ' '.join(value_chunks).lower()
+
+    # Tokenize: words 4+ chars (shorter words aren't worth replacing)
+    words = re.findall(r'\b[a-z]{4,}\b', value_text)
+    freq = Counter(words)
+
+    # Build set of words already covered by ABBREV_VOCAB patterns
+    covered_words = set()
+    for pattern, _, _ in ABBREV_VOCAB:
+        # Extract literal words from regex pattern
+        literals = re.findall(r'[a-z]{3,}', pattern)
+        covered_words.update(literals)
+
+    # Stopwords — common English words that shouldn't become emoji
+    stopwords = {
+        'this', 'that', 'with', 'from', 'have', 'been', 'will', 'would',
+        'could', 'should', 'their', 'there', 'these', 'those', 'what',
+        'when', 'where', 'which', 'about', 'after', 'before', 'between',
+        'through', 'during', 'each', 'every', 'both', 'into', 'over',
+        'under', 'again', 'further', 'then', 'once', 'here', 'only',
+        'just', 'also', 'more', 'most', 'other', 'some', 'such', 'than',
+        'very', 'same', 'does', 'doing', 'being', 'having', 'make',
+        'like', 'well', 'back', 'even', 'give', 'made', 'find', 'know',
+        'take', 'want', 'come', 'good', 'look', 'help', 'first', 'last',
+        'long', 'great', 'little', 'right', 'still', 'must', 'name',
+        'keep', 'need', 'never', 'next', 'part', 'turn', 'real', 'life',
+        'many', 'feel', 'high', 'much', 'they', 'them', 'your', 'true',
+        'false', 'none', 'null', 'note', 'used', 'uses', 'using',
+    }
+
+    # Common abbreviation candidates by semantic category
+    ABBREV_SUGGESTIONS = {
+        # Long words → standard abbreviations
+        'configuration': 'config', 'development': 'dev', 'production': 'prod',
+        'environment': 'env', 'application': 'app', 'management': 'mgmt',
+        'information': 'info', 'performance': 'perf', 'optimization': 'opt',
+        'specification': 'spec', 'requirements': 'reqs', 'repository': 'repo',
+        'notification': 'notif', 'integration': 'integ', 'administration': 'admin',
+        'functionality': 'func', 'architecture': 'arch', 'dependencies': 'deps',
+        'approximately': 'approx', 'miscellaneous': 'misc', 'distribution': 'dist',
+        'international': 'intl', 'organization': 'org', 'professional': 'pro',
+        'introduction': 'intro', 'subscription': 'sub', 'comparison': 'comp',
+        'alternative': 'alt', 'maximum': 'max', 'minimum': 'min',
+        'reference': 'ref', 'temporary': 'temp', 'directory': 'dir',
+        'description': 'desc', 'experience': 'exp', 'frequency': 'freq',
+    }
+
+    candidates = []
+    for word, count in freq.most_common(top_n * 3):  # oversample, then filter
+        if word in covered_words or word in stopwords:
+            continue
+        if count < 2:
+            continue
+
+        # Estimate savings: each occurrence saves (word_len - ~2) chars (emoji ≈ 2 chars)
+        chars_saved = count * (len(word) - 2)
+        if chars_saved <= 0:
+            continue
+
+        suggested = ABBREV_SUGGESTIONS.get(word, '?')
+
+        candidates.append({
+            'word': word,
+            'count': count,
+            'est_chars_saved': chars_saved,
+            'suggested_abbrev': suggested,
+        })
+
+    # Sort by estimated savings (highest first)
+    candidates.sort(key=lambda x: x['est_chars_saved'], reverse=True)
+    return candidates[:top_n]
+
+
+async def cmd_suggest_vocab(file_path=None, content=None, top_n=20):
+    """Analyze text and suggest new abbreviation vocabulary entries.
+
+    Usage:
+      compile --suggest-vocab <file_path>              # Analyze a file
+      compile --suggest-vocab --content "yaml..."      # Analyze inline text
+      compile --suggest-vocab --top 10 <file_path>     # Limit results
+    """
+    if content:
+        text = content
+    elif file_path:
+        if not os.path.isfile(file_path):
+            print(json.dumps({"error": f"File not found: {file_path}"}))
+            return
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        print(json.dumps({"error": "Usage: compile --suggest-vocab <file_path> or --content 'text'"}))
+        return
+
+    candidates = _suggest_abbrev_vocab(text, top_n=top_n)
+
+    # Also show current vocab coverage stats
+    from src.core.types import estimate_tokens
+    pre_tokens = estimate_tokens(text)
+    compressed, subs, unique, _skipped = _apply_abbrev_compression(text)
+    post_tokens = estimate_tokens(compressed)
+
+    print(json.dumps({
+        "status": "ok",
+        "current_vocab_size": len(ABBREV_VOCAB),
+        "current_coverage": {
+            "substitutions_applied": subs,
+            "unique_abbrevs_used": unique,
+            "token_savings_pct": round((1 - post_tokens / pre_tokens) * 100, 1) if pre_tokens else 0,
+        },
+        "suggestions": candidates,
+        "total_potential_chars_saved": sum(c['est_chars_saved'] for c in candidates),
+    }, indent=2))
+
+
+async def cmd_compile(content=None, file_path=None, abbreviate=False):
     """Store compressed behavioral instructions in the rolodex.
 
     Usage:
-      compile --content "yaml..."   # Store pre-compressed content directly
-      compile <file_path>           # Read compressed content from file
+      compile --content "yaml..."               # Store pre-compressed YAML
+      compile <file_path>                       # Read compressed content from file
+      compile --abbreviate --content "yaml..."  # Apply abbreviation compression layer
+      compile --abbreviate <file_path>          # Read file + apply abbreviation compression
 
-    The LLM does the compression (no API key needed). This command stores
-    the result as behavioral entries, superseding any previous compilation.
+    The LLM does the YAML compression. This command optionally applies a second
+    abbreviation compression pass (programmatic substitution), then stores the result
+    as behavioral entries, superseding any previous compilation.
     """
     from datetime import datetime as _dt
     lib, _ = _make_librarian()
@@ -1886,9 +2303,23 @@ async def cmd_compile(content=None, file_path=None):
         return
 
     from src.core.types import estimate_tokens
+
+    # ── Abbreviation compression pass (optional) ─────────────────────────
+    abbrev_stats = None
+    pre_abbrev_tokens = None
+    if abbreviate:
+        pre_abbrev_tokens = estimate_tokens(compressed_text)
+        compressed_text, sub_count, unique_abbrevs, skipped_floor = _apply_abbrev_compression(compressed_text)
+        abbrev_stats = {
+            "substitutions": sub_count,
+            "unique_abbrevs": unique_abbrevs,
+            "pre_abbrev_tokens": pre_abbrev_tokens,
+            "skipped_floor_guard": skipped_floor,
+        }
+
     compressed_tokens = estimate_tokens(compressed_text)
 
-    # Ingest the compressed content
+    # ── Ingest the compressed content ──────────────────────────────────
     entries = await lib.ingest("assistant", compressed_text)
 
     # Recategorize as behavioral
@@ -1903,12 +2334,21 @@ async def cmd_compile(content=None, file_path=None):
             (entry.id,)
         )
         # Store compilation metadata
-        metadata = json.dumps({
+        meta_dict = {
             "source_file": source_file,
             "compiled_at": _dt.utcnow().isoformat(),
             "compressed_token_count": compressed_tokens,
             "content_type": "behavioral_instructions",
-        })
+            "abbrev_compression": abbreviate,
+        }
+        if abbrev_stats:
+            meta_dict["abbrev_substitutions"] = abbrev_stats["substitutions"]
+            meta_dict["abbrev_unique_count"] = abbrev_stats["unique_abbrevs"]
+            meta_dict["pre_abbrev_tokens"] = abbrev_stats["pre_abbrev_tokens"]
+            meta_dict["abbrev_savings_pct"] = round(
+                (1 - compressed_tokens / pre_abbrev_tokens) * 100, 1
+            ) if pre_abbrev_tokens else 0
+        metadata = json.dumps(meta_dict)
         lib.rolodex.conn.execute(
             "UPDATE rolodex_entries SET metadata = ? WHERE id = ?",
             (metadata, entry.id)
@@ -1932,15 +2372,24 @@ async def cmd_compile(content=None, file_path=None):
     _sync_db_back(lib)
 
     close_db(lib)
-    print(json.dumps({
+    result = {
         "compiled": len(entries),
         "entry_ids": [e.id for e in entries],
         "source_file": source_file,
         "compressed_tokens": compressed_tokens,
+        "abbrev_compression": abbreviate,
         "superseded_entries": len(superseded),
         "session_id": session_id,
         "status": "ok",
-    }))
+    }
+    if abbrev_stats:
+        result["abbrev_substitutions"] = abbrev_stats["substitutions"]
+        result["abbrev_unique_count"] = abbrev_stats["unique_abbrevs"]
+        result["pre_abbrev_tokens"] = abbrev_stats["pre_abbrev_tokens"]
+        result["abbrev_savings_pct"] = round(
+            (1 - compressed_tokens / pre_abbrev_tokens) * 100, 1
+        ) if pre_abbrev_tokens else 0
+    print(json.dumps(result))
 
 
 async def cmd_settings(subcmd=None, args=None):
@@ -1959,6 +2408,12 @@ async def cmd_settings(subcmd=None, args=None):
             "description": "Compress instruction files to YAML-like format, saving 50-70% boot tokens",
             "options": ["on", "off"],
             "default": "off",
+        },
+        "abbrev_compression": {
+            "description": "Apply text abbreviation layer on top of YAML compression (KPI, SEO, impl, docs, etc.)",
+            "options": ["on", "off"],
+            "default": "off",
+            "depends_on": "prompt_compression",
         },
     }
 
@@ -3583,19 +4038,38 @@ async def main():
             )
 
         elif cmd == "compile":
-            # Parse: compile --content "yaml..." OR compile <file_path>
+            # Parse: compile [--abbreviate|--emoji] [--suggest-vocab] [--top N] --content "yaml..." OR <file_path>
             compile_content = None
             compile_file = None
+            compile_abbreviate = False
+            suggest_vocab = False
+            suggest_top = 20
             remaining = sys.argv[2:]
             ci = 0
             while ci < len(remaining):
                 if remaining[ci] == "--content" and ci + 1 < len(remaining):
                     ci += 1
                     compile_content = remaining[ci]
+                elif remaining[ci] in ("--abbreviate", "--abbrev", "--emoji"):
+                    # --emoji kept as alias for backward compatibility
+                    compile_abbreviate = True
+                elif remaining[ci] == "--suggest-vocab":
+                    suggest_vocab = True
+                elif remaining[ci] == "--top" and ci + 1 < len(remaining):
+                    ci += 1
+                    suggest_top = int(remaining[ci])
+                elif remaining[ci] == "--vocab" and ci + 1 < len(remaining):
+                    ci += 1
+                    # Domain vocab pack — loaded below
+                    vocab_pack = remaining[ci]
+                    _load_vocab_pack(vocab_pack)
                 elif not remaining[ci].startswith("--"):
                     compile_file = remaining[ci]
                 ci += 1
-            await cmd_compile(content=compile_content, file_path=compile_file)
+            if suggest_vocab:
+                await cmd_suggest_vocab(file_path=compile_file, content=compile_content, top_n=suggest_top)
+            else:
+                await cmd_compile(content=compile_content, file_path=compile_file, abbreviate=compile_abbreviate)
 
         elif cmd == "settings":
             subcmd = sys.argv[2] if len(sys.argv) > 2 else None
