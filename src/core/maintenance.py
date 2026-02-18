@@ -10,12 +10,14 @@ Passes:
     3. Near-duplicate merging — find entries saying the same thing in different words
     4. Entry promotion — promote high-value cold entries to user_knowledge
     5. Stale temporal flagging — flag entries with time-sensitive claims that may be outdated
+    6. Compression learning — analyze codebook patterns, score confidence, promote stages
 
 Token budget: each pass has a budget. The engine stops when the total budget is exhausted.
 Cooldown: won't run if the last maintenance completed within `cooldown_hours`.
 """
 
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -23,8 +25,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from .types import EntryCategory, RolodexEntry, Tier, estimate_tokens
-from ..storage.schema import deserialize_entry
+from .types import EntryCategory, CompressionStage, RolodexEntry, Tier, estimate_tokens
+from ..storage.schema import deserialize_entry, ensure_codebook_schema
 
 
 # ─── Maintenance Log Schema ──────────────────────────────────────────────────
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS maintenance_log (
     duplicates_merged INTEGER DEFAULT 0,
     entries_promoted INTEGER DEFAULT 0,
     stale_flagged INTEGER DEFAULT 0,
+    compressions_learned INTEGER DEFAULT 0,
     token_budget INTEGER DEFAULT 0,
     tokens_used INTEGER DEFAULT 0,
     metadata TEXT DEFAULT '{}'
@@ -56,6 +59,12 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_completed
 def ensure_maintenance_schema(conn: sqlite3.Connection):
     """Create the maintenance_log table if it doesn't exist."""
     conn.executescript(MAINTENANCE_SCHEMA)
+    # Safe column addition for existing databases
+    try:
+        conn.execute("ALTER TABLE maintenance_log ADD COLUMN compressions_learned INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 
@@ -181,6 +190,7 @@ class MaintenanceEngine:
         self.duplicates_merged = 0
         self.entries_promoted = 0
         self.stale_flagged = 0
+        self.compressions_learned = 0
         self.entries_scanned = 0
         self.actions: List[Dict[str, Any]] = []
         self.passes_run: List[str] = []
@@ -835,6 +845,225 @@ class MaintenanceEngine:
         self.stale_flagged = flagged
         return flagged
 
+    # ─── Pass 6: Compression Learning ───────────────────────────────────
+
+    def pass_compression_learning(
+        self,
+        warm_threshold: int = 3,
+        hot_threshold: int = 8,
+        warm_confidence: float = 0.8,
+        hot_confidence: float = 0.9,
+        vocab_pack_dir: Optional[str] = None,
+    ) -> int:
+        """Analyze codebook patterns, update confidence scores, promote stages.
+
+        Three sub-steps:
+        1. Confidence scoring — based on times_seen and stability
+        2. Stage promotion — COLD→WARM at threshold, WARM→HOT at higher threshold
+        3. Vocab pack generation — write learned.json for boot-time loading
+
+        Args:
+            warm_threshold: times_seen required for COLD→WARM promotion
+            hot_threshold: times_seen required for WARM→HOT promotion
+            warm_confidence: minimum confidence for COLD→WARM
+            hot_confidence: minimum confidence for WARM→HOT
+            vocab_pack_dir: directory to write learned.json (auto-detected if None)
+
+        Returns:
+            Number of patterns promoted or updated
+        """
+        self.passes_run.append("compression_learning")
+        ensure_codebook_schema(self.conn)
+
+        if self._budget_remaining() <= 0:
+            return 0
+
+        now = datetime.utcnow().isoformat()
+        learned = 0
+
+        # ── Step 1: Confidence scoring ────────────────────────────────────
+        rows = self.conn.execute(
+            """SELECT id, pattern_text, warm_form, hot_form, stage,
+                      token_cost_original, token_cost_warm, token_cost_hot,
+                      times_seen, confidence, first_seen_at, last_seen_at,
+                      promoted_at, metadata
+               FROM compression_codebook
+               ORDER BY times_seen DESC"""
+        ).fetchall()
+
+        self._charge_tokens(f"codebook_scan_{len(rows)}")
+
+        for row in rows:
+            if self._budget_remaining() <= 0:
+                break
+
+            entry_id = row["id"]
+            stage = row["stage"]
+            times_seen = row["times_seen"]
+            old_confidence = row["confidence"]
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+
+            # Determine promotion target and threshold
+            if stage == CompressionStage.COLD.value:
+                target_threshold = warm_threshold
+            elif stage == CompressionStage.WARM.value:
+                target_threshold = hot_threshold
+            else:
+                continue  # Already HOT, nothing to do
+
+            # Stability factor: check if pattern_text has been consistent
+            # (metadata can track variation count; default to stable)
+            variation_count = meta.get("variation_count", 0)
+            stability = 1.0 if variation_count <= 1 else max(0.3, 1.0 - (variation_count * 0.15))
+
+            # Compute confidence
+            raw_confidence = min(1.0, times_seen / target_threshold)
+            confidence = round(raw_confidence * stability, 3)
+
+            # Update confidence if changed
+            if abs(confidence - old_confidence) > 0.001:
+                self.conn.execute(
+                    "UPDATE compression_codebook SET confidence = ? WHERE id = ?",
+                    (confidence, entry_id)
+                )
+
+            # ── Step 2: Stage promotion ───────────────────────────────────
+            promoted = False
+
+            if stage == CompressionStage.COLD.value and confidence >= warm_confidence and times_seen >= warm_threshold:
+                # COLD → WARM: the warm_form already exists from compile recording
+                # Validate token savings
+                tok_orig = row["token_cost_original"] or 0
+                tok_warm = row["token_cost_warm"] or 0
+                if tok_warm < tok_orig:
+                    self.conn.execute(
+                        """UPDATE compression_codebook SET
+                            stage = ?, promoted_at = ?, confidence = ?
+                           WHERE id = ?""",
+                        (CompressionStage.WARM.value, now, confidence, entry_id)
+                    )
+                    self.actions.append({
+                        "type": "compression_promoted",
+                        "entry_id": entry_id,
+                        "from_stage": "COLD",
+                        "to_stage": "WARM",
+                        "pattern": row["pattern_text"][:80],
+                        "warm_form": row["warm_form"][:40],
+                        "token_savings": tok_orig - tok_warm,
+                        "times_seen": times_seen,
+                    })
+                    promoted = True
+                    learned += 1
+
+            elif stage == CompressionStage.WARM.value and confidence >= hot_confidence and times_seen >= hot_threshold:
+                # WARM → HOT: collapse to single emoji or minimal token
+                # The hot_form is the most dominant emoji from the warm_form
+                import re
+                emoji_pat = re.compile(
+                    r'[\U0001F300-\U0001F9FF\U00002702-\U000027B0\U0000FE00-\U0000FEFF'
+                    r'\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF]'
+                )
+                emojis = emoji_pat.findall(row["warm_form"])
+                if emojis:
+                    hot_form = emojis[0]  # Primary emoji becomes the hot token
+                else:
+                    # No emoji — use the abbreviation as-is (already minimal)
+                    hot_form = row["warm_form"]
+
+                tok_hot = estimate_tokens(hot_form)
+                tok_orig = row["token_cost_original"] or 0
+
+                if tok_hot < (row["token_cost_warm"] or tok_orig):
+                    self.conn.execute(
+                        """UPDATE compression_codebook SET
+                            stage = ?, hot_form = ?, token_cost_hot = ?,
+                            promoted_at = ?, confidence = ?
+                           WHERE id = ?""",
+                        (CompressionStage.HOT.value, hot_form, tok_hot,
+                         now, confidence, entry_id)
+                    )
+                    self.actions.append({
+                        "type": "compression_promoted",
+                        "entry_id": entry_id,
+                        "from_stage": "WARM",
+                        "to_stage": "HOT",
+                        "pattern": row["pattern_text"][:80],
+                        "warm_form": row["warm_form"][:40],
+                        "hot_form": hot_form,
+                        "token_savings": tok_orig - tok_hot,
+                        "times_seen": times_seen,
+                    })
+                    promoted = True
+                    learned += 1
+
+            self.entries_scanned += 1
+
+        # ── Step 3: Vocab pack generation ─────────────────────────────────
+        # Write learned.json with all WARM+ patterns for boot-time loading
+        if learned > 0 or not rows:
+            self._generate_learned_vocab_pack(vocab_pack_dir)
+
+        self.conn.commit()
+        self.compressions_learned = learned
+        return learned
+
+    def _generate_learned_vocab_pack(self, vocab_pack_dir: Optional[str] = None):
+        """Write a learned.json vocab pack from WARM+ codebook entries.
+
+        The vocab pack format matches _load_vocab_pack() expectations:
+        [{"pattern": "regex", "replacement": "abbreviation", "flags": "vi"}, ...]
+        """
+        import re
+
+        rows = self.conn.execute(
+            """SELECT pattern_text, warm_form, hot_form, stage, confidence
+               FROM compression_codebook
+               WHERE stage >= ? AND confidence >= 0.8
+               ORDER BY confidence DESC, times_seen DESC""",
+            (CompressionStage.WARM.value,)
+        ).fetchall()
+
+        if not rows:
+            return
+
+        pack_entries = []
+        for row in rows:
+            # Use hot_form if available, otherwise warm_form
+            replacement = row["hot_form"] if row["hot_form"] and row["stage"] == CompressionStage.HOT.value else row["warm_form"]
+            # Build regex from pattern_text: escape and add word boundaries
+            pattern_text = row["pattern_text"]
+            pattern_regex = r'\b' + re.escape(pattern_text) + r'\b'
+
+            pack_entries.append({
+                "pattern": pattern_regex,
+                "replacement": replacement,
+                "flags": "vi",
+                "confidence": row["confidence"],
+                "stage": row["stage"],
+            })
+
+        # Determine output directory
+        if not vocab_pack_dir:
+            # Try standard locations
+            this_dir = os.path.dirname(os.path.abspath(__file__))
+            cli_dir = os.path.dirname(this_dir)  # Go up from src/core/ to librarian/
+            # Check if we're in src/core — go up two levels to librarian/
+            if os.path.basename(this_dir) == "core":
+                cli_dir = os.path.dirname(os.path.dirname(this_dir))
+            vocab_pack_dir = os.path.join(cli_dir, "vocab_packs")
+
+        os.makedirs(vocab_pack_dir, exist_ok=True)
+        pack_path = os.path.join(vocab_pack_dir, "learned.json")
+
+        with open(pack_path, "w", encoding="utf-8") as f:
+            json.dump(pack_entries, f, indent=2, ensure_ascii=False)
+
+        self.actions.append({
+            "type": "vocab_pack_generated",
+            "path": pack_path,
+            "entries": len(pack_entries),
+        })
+
     # ─── Run All Passes ──────────────────────────────────────────────────
 
     def run_all(self) -> Dict[str, Any]:
@@ -875,9 +1104,13 @@ class MaintenanceEngine:
             if self._budget_remaining() > 0:
                 self.pass_entry_promotion()
 
-            # 5. Stale flagging (lowest priority — informational only)
+            # 5. Stale flagging (informational only)
             if self._budget_remaining() > 0:
                 self.pass_stale_temporal_flagging()
+
+            # 6. Compression learning (analyze codebook, promote patterns)
+            if self._budget_remaining() > 0:
+                self.pass_compression_learning()
 
             self.conn.commit()
         except Exception as e:
@@ -891,7 +1124,7 @@ class MaintenanceEngine:
         total_actions = (
             self.contradictions_found + self.orphans_linked +
             self.duplicates_merged + self.entries_promoted +
-            self.stale_flagged
+            self.stale_flagged + self.compressions_learned
         )
 
         # Update log
@@ -906,6 +1139,7 @@ class MaintenanceEngine:
                 duplicates_merged = ?,
                 entries_promoted = ?,
                 stale_flagged = ?,
+                compressions_learned = ?,
                 tokens_used = ?,
                 metadata = ?
                WHERE id = ?""",
@@ -919,6 +1153,7 @@ class MaintenanceEngine:
                 self.duplicates_merged,
                 self.entries_promoted,
                 self.stale_flagged,
+                self.compressions_learned,
                 self.tokens_used,
                 json.dumps({"actions": self.actions}),
                 log_id,
@@ -940,6 +1175,7 @@ class MaintenanceEngine:
                 "duplicates_merged": self.duplicates_merged,
                 "entries_promoted": self.entries_promoted,
                 "stale_flagged": self.stale_flagged,
+                "compressions_learned": self.compressions_learned,
                 "total_actions": total_actions,
             },
             "actions": self.actions,

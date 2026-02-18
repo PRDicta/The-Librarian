@@ -41,6 +41,10 @@ class EntryCategory(Enum):
     USER_KNOWLEDGE = "user_knowledge"
     # Privileged tier — compressed behavioral instructions
     BEHAVIORAL = "behavioral"
+class CompressionStage(Enum):
+    COLD = 0      # Full prose — never compressed
+    WARM = 1      # Emoji-anchored / abbreviated — pattern recognized
+    HOT = 2       # Single-token — high confidence, shared context
 class Tier(Enum):
     HOT = "hot"
     COLD = "cold"

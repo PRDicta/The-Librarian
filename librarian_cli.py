@@ -843,6 +843,26 @@ async def cmd_boot(compact=False, full_context=False):
             except Exception:
                 pass
 
+    # Load learned vocab pack + track codebook usage
+    codebook_loaded = 0
+    codebook_usage_updated = 0
+    if compression_enabled:
+        try:
+            learned_pack = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "vocab_packs", "learned.json"
+            )
+            if os.path.isfile(learned_pack):
+                codebook_loaded = _load_vocab_pack("learned")
+        except Exception:
+            pass
+        if behavioral_entries:
+            try:
+                codebook_usage_updated = _update_codebook_usage(
+                    lib.rolodex.conn, behavioral_entries
+                )
+            except Exception:
+                pass
+
     fixed_token_cost = estimate_tokens(profile_block + behavioral_block + uk_block)
 
     # Phase 9: Context window state
@@ -909,6 +929,8 @@ async def cmd_boot(compact=False, full_context=False):
             "behavioral_entries": len(behavioral_entries),
             "prompt_compression_enabled": compression_enabled,
             "abbrev_compression_active": abbrev_compression_active,
+            "codebook_vocab_loaded": codebook_loaded,
+            "codebook_usage_tracked": codebook_usage_updated,
             "past_sessions": len(past_sessions),
             "user_profile": user_profile_json,
             "embedding_strategy": embedding_strategy,
@@ -2022,6 +2044,172 @@ def _load_vocab_pack(pack_name):
         return 0
 
 
+# ─── Compression Codebook ─────────────────────────────────────────────────
+def _ensure_codebook(conn):
+    """Ensure codebook table exists."""
+    from src.storage.schema import ensure_codebook_schema
+    ensure_codebook_schema(conn)
+
+
+def _upsert_codebook_pattern(conn, pattern_text, warm_form, entry_id,
+                              token_cost_original=None, token_cost_warm=None):
+    """Record or update a compression pattern in the codebook.
+
+    If the pattern already exists (matched by pattern_text), increments times_seen
+    and updates last_seen_at. Otherwise inserts a new COLD-stage entry.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    from src.core.types import estimate_tokens, CompressionStage
+
+    now = _dt.utcnow().isoformat()
+
+    if token_cost_original is None:
+        token_cost_original = estimate_tokens(pattern_text)
+    if token_cost_warm is None:
+        token_cost_warm = estimate_tokens(warm_form)
+
+    # Check if pattern already exists
+    existing = conn.execute(
+        "SELECT id, times_seen, source_entry_ids FROM compression_codebook WHERE pattern_text = ?",
+        (pattern_text,)
+    ).fetchone()
+
+    if existing:
+        old_ids = json.loads(existing["source_entry_ids"]) if existing["source_entry_ids"] else []
+        if entry_id not in old_ids:
+            old_ids.append(entry_id)
+        conn.execute(
+            """UPDATE compression_codebook SET
+                times_seen = times_seen + 1,
+                last_seen_at = ?,
+                source_entry_ids = ?,
+                warm_form = ?,
+                token_cost_warm = ?
+               WHERE id = ?""",
+            (now, json.dumps(old_ids), warm_form, token_cost_warm, existing["id"])
+        )
+        return existing["id"]
+    else:
+        cid = str(_uuid.uuid4())[:8]
+        conn.execute(
+            """INSERT INTO compression_codebook
+               (id, pattern_text, warm_form, stage, token_cost_original, token_cost_warm,
+                times_seen, confidence, first_seen_at, last_seen_at, source_entry_ids)
+               VALUES (?, ?, ?, ?, ?, ?, 1, 0.0, ?, ?, ?)""",
+            (cid, pattern_text, warm_form, CompressionStage.COLD.value,
+             token_cost_original, token_cost_warm,
+             now, now, json.dumps([entry_id]))
+        )
+        return cid
+
+
+def _extract_and_record_patterns(conn, compressed_text, original_text, entry_ids):
+    """Extract compression patterns from a compile operation and record them in the codebook.
+
+    Detects two pattern types:
+    1. Abbreviation substitutions: multi-word phrases collapsed to acronyms
+    2. Emoji anchors: emoji characters used as semantic markers in the YAML
+
+    Args:
+        conn: SQLite connection
+        compressed_text: The final compressed YAML text
+        original_text: The pre-compression text (or compressed pre-abbreviation)
+        entry_ids: List of behavioral entry IDs produced by this compile
+    """
+    import re
+    from src.core.types import estimate_tokens
+
+    _ensure_codebook(conn)
+    patterns_recorded = 0
+    entry_id = entry_ids[0] if entry_ids else "unknown"
+
+    # ── 1. Abbreviation patterns ──────────────────────────────────────────
+    # For each ABBREV_VOCAB entry, check if it was applied (replacement exists in text)
+    for pattern, replacement, flags in ABBREV_VOCAB:
+        if replacement == "user_knowledge":  # Skip internal marker
+            continue
+        if re.search(r'\b' + re.escape(replacement) + r'\b', compressed_text):
+            # Find the original phrase from ABBREV_EXPANSIONS
+            expansion = ABBREV_EXPANSIONS.get(replacement)
+            if expansion:
+                _upsert_codebook_pattern(
+                    conn, expansion, replacement, entry_id,
+                    token_cost_original=estimate_tokens(expansion),
+                    token_cost_warm=estimate_tokens(replacement)
+                )
+                patterns_recorded += 1
+
+    # ── 2. Emoji anchor patterns ──────────────────────────────────────────
+    # Detect emoji used as semantic markers in YAML keys/values
+    emoji_pattern = re.compile(
+        r'[\U0001F300-\U0001F9FF\U00002702-\U000027B0\U0000FE00-\U0000FEFF'
+        r'\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
+        r'\U0000200D\U00002B50\U0000231A-\U0000231B\U000023E9-\U000023F3'
+        r'\U000023F8-\U000023FA\U000025AA-\U000025AB\U000025B6\U000025C0'
+        r'\U000025FB-\U000025FE\U00002934-\U00002935\U00002B05-\U00002B07]+'
+    )
+
+    # Find emoji in context: extract the line containing each emoji
+    for line in compressed_text.split('\n'):
+        emojis_in_line = emoji_pattern.findall(line)
+        if emojis_in_line:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            # The line IS the warm form; the full verbose equivalent is the pattern
+            for emoji in emojis_in_line:
+                # Record the line as a pattern — the emoji is the warm anchor
+                _upsert_codebook_pattern(
+                    conn, stripped, emoji, entry_id,
+                    token_cost_original=estimate_tokens(stripped),
+                    token_cost_warm=estimate_tokens(emoji)
+                )
+                patterns_recorded += 1
+
+    conn.commit()
+    return patterns_recorded
+
+
+def _update_codebook_usage(conn, behavioral_entries):
+    """Increment times_seen for codebook patterns found in active behavioral entries.
+
+    Called at boot to close the feedback loop: patterns that survive across
+    boots gain confidence toward promotion.
+    """
+    from src.core.types import CompressionStage
+
+    _ensure_codebook(conn)
+
+    # Get all codebook patterns
+    rows = conn.execute(
+        "SELECT id, pattern_text, warm_form, hot_form, stage FROM compression_codebook"
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    # Combine all behavioral content
+    combined = "\n".join(e.content for e in behavioral_entries)
+    from datetime import datetime as _dt
+    now = _dt.utcnow().isoformat()
+    updated = 0
+
+    for row in rows:
+        # Check if the warm_form (or hot_form if promoted) appears in current behavioral content
+        check_form = row["hot_form"] if row["hot_form"] and row["stage"] == CompressionStage.HOT.value else row["warm_form"]
+        if check_form and check_form in combined:
+            conn.execute(
+                "UPDATE compression_codebook SET times_seen = times_seen + 1, last_seen_at = ? WHERE id = ?",
+                (now, row["id"])
+            )
+            updated += 1
+
+    if updated:
+        conn.commit()
+    return updated
+
+
 def _apply_abbrev_compression(text):
     """Apply programmatic text abbreviation to YAML-compressed text.
 
@@ -2355,6 +2543,19 @@ async def cmd_compile(content=None, file_path=None, abbreviate=False):
         )
     lib.rolodex.conn.commit()
 
+    # ── Record patterns to compression codebook ─────────────────────────
+    codebook_patterns = 0
+    try:
+        codebook_patterns = _extract_and_record_patterns(
+            lib.rolodex.conn,
+            compressed_text,
+            content or "",  # original text if available
+            [e.id for e in entries]
+        )
+    except Exception as e:
+        # Non-fatal — codebook is a learning layer, not critical path
+        pass
+
     # Supersede old behavioral entries
     new_ids = {e.id for e in entries}
     old_rows = lib.rolodex.conn.execute(
@@ -2379,6 +2580,7 @@ async def cmd_compile(content=None, file_path=None, abbreviate=False):
         "compressed_tokens": compressed_tokens,
         "abbrev_compression": abbreviate,
         "superseded_entries": len(superseded),
+        "codebook_patterns_recorded": codebook_patterns,
         "session_id": session_id,
         "status": "ok",
     }
@@ -2462,6 +2664,200 @@ async def cmd_settings(subcmd=None, args=None):
     else:
         close_db(lib)
         print(json.dumps({"error": f"Unknown subcommand: {subcmd}. Use show|set"}))
+
+
+async def cmd_codebook(subcmd=None, args=None):
+    """View and manage the compression codebook — learned patterns.
+
+    Usage:
+      codebook show                  List all patterns with stage/confidence
+      codebook show --stage hot      Filter by compression stage (cold/warm/hot)
+      codebook promote <id>          Manually promote a pattern one stage
+      codebook demote <id>           Demote a pattern one stage
+      codebook stats                 Summary statistics
+    """
+    from src.core.types import CompressionStage, estimate_tokens
+    from src.storage.schema import ensure_codebook_schema
+
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="codebook")
+    conn = lib.rolodex.conn
+    ensure_codebook_schema(conn)
+
+    if not subcmd or subcmd == "show":
+        # Parse optional --stage filter
+        stage_filter = None
+        if args:
+            for i, a in enumerate(args):
+                if a == "--stage" and i + 1 < len(args):
+                    stage_name = args[i + 1].upper()
+                    try:
+                        stage_filter = CompressionStage[stage_name].value
+                    except KeyError:
+                        close_db(lib)
+                        print(json.dumps({"error": f"Unknown stage: {stage_name}. Use cold/warm/hot"}))
+                        return
+
+        query = "SELECT * FROM compression_codebook"
+        params = []
+        if stage_filter is not None:
+            query += " WHERE stage = ?"
+            params.append(stage_filter)
+        query += " ORDER BY stage DESC, confidence DESC, times_seen DESC"
+
+        rows = conn.execute(query, params).fetchall()
+        entries = []
+        for row in rows:
+            stage_name = CompressionStage(row["stage"]).name
+            entries.append({
+                "id": row["id"],
+                "pattern": row["pattern_text"][:80],
+                "warm_form": row["warm_form"][:40],
+                "hot_form": row["hot_form"] if row["hot_form"] else None,
+                "stage": stage_name,
+                "tokens": {
+                    "original": row["token_cost_original"],
+                    "warm": row["token_cost_warm"],
+                    "hot": row["token_cost_hot"],
+                },
+                "times_seen": row["times_seen"],
+                "confidence": row["confidence"],
+                "first_seen": row["first_seen_at"],
+                "last_seen": row["last_seen_at"],
+            })
+
+        close_db(lib)
+        print(json.dumps({"codebook": entries, "total": len(entries)}, indent=2))
+
+    elif subcmd == "promote":
+        if not args:
+            close_db(lib)
+            print(json.dumps({"error": "Usage: codebook promote <id>"}))
+            return
+        target_id = args[0]
+        row = conn.execute(
+            "SELECT * FROM compression_codebook WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not row:
+            close_db(lib)
+            print(json.dumps({"error": f"Pattern not found: {target_id}"}))
+            return
+
+        current_stage = row["stage"]
+        if current_stage >= CompressionStage.HOT.value:
+            close_db(lib)
+            print(json.dumps({"error": "Already at HOT stage — cannot promote further"}))
+            return
+
+        from datetime import datetime as _dt
+        now = _dt.utcnow().isoformat()
+        new_stage = current_stage + 1
+
+        if new_stage == CompressionStage.HOT.value:
+            # Need to generate hot_form
+            import re
+            emoji_pat = re.compile(
+                r'[\U0001F300-\U0001F9FF\U00002702-\U000027B0\U00002600-\U000026FF]'
+            )
+            emojis = emoji_pat.findall(row["warm_form"])
+            hot_form = emojis[0] if emojis else row["warm_form"]
+            tok_hot = estimate_tokens(hot_form)
+            conn.execute(
+                """UPDATE compression_codebook SET
+                    stage = ?, hot_form = ?, token_cost_hot = ?,
+                    promoted_at = ?, confidence = 1.0
+                   WHERE id = ?""",
+                (new_stage, hot_form, tok_hot, now, target_id)
+            )
+        else:
+            conn.execute(
+                """UPDATE compression_codebook SET
+                    stage = ?, promoted_at = ?, confidence = 1.0
+                   WHERE id = ?""",
+                (new_stage, now, target_id)
+            )
+
+        conn.commit()
+        _sync_db_back(lib)
+        close_db(lib)
+        print(json.dumps({
+            "promoted": target_id,
+            "from": CompressionStage(current_stage).name,
+            "to": CompressionStage(new_stage).name,
+        }))
+
+    elif subcmd == "demote":
+        if not args:
+            close_db(lib)
+            print(json.dumps({"error": "Usage: codebook demote <id>"}))
+            return
+        target_id = args[0]
+        row = conn.execute(
+            "SELECT * FROM compression_codebook WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not row:
+            close_db(lib)
+            print(json.dumps({"error": f"Pattern not found: {target_id}"}))
+            return
+
+        current_stage = row["stage"]
+        if current_stage <= CompressionStage.COLD.value:
+            close_db(lib)
+            print(json.dumps({"error": "Already at COLD stage — cannot demote further"}))
+            return
+
+        new_stage = current_stage - 1
+        conn.execute(
+            """UPDATE compression_codebook SET
+                stage = ?, confidence = 0.5, hot_form = NULL, token_cost_hot = NULL
+               WHERE id = ?""",
+            (new_stage, target_id)
+        )
+        conn.commit()
+        _sync_db_back(lib)
+        close_db(lib)
+        print(json.dumps({
+            "demoted": target_id,
+            "from": CompressionStage(current_stage).name,
+            "to": CompressionStage(new_stage).name,
+        }))
+
+    elif subcmd == "stats":
+        rows = conn.execute(
+            "SELECT stage, COUNT(*) as cnt FROM compression_codebook GROUP BY stage"
+        ).fetchall()
+        stage_dist = {CompressionStage(r["stage"]).name: r["cnt"] for r in rows}
+        total = sum(r["cnt"] for r in rows)
+
+        # Token savings
+        savings_row = conn.execute(
+            """SELECT
+                SUM(token_cost_original) as total_original,
+                SUM(CASE
+                    WHEN stage = 2 AND token_cost_hot IS NOT NULL THEN token_cost_hot
+                    WHEN stage >= 1 THEN token_cost_warm
+                    ELSE token_cost_original
+                END) as total_compressed
+               FROM compression_codebook"""
+        ).fetchone()
+        total_original = savings_row["total_original"] or 0
+        total_compressed = savings_row["total_compressed"] or 0
+        savings_pct = round((1 - total_compressed / total_original) * 100, 1) if total_original else 0
+
+        close_db(lib)
+        print(json.dumps({
+            "total_patterns": total,
+            "stage_distribution": stage_dist,
+            "token_savings": {
+                "total_original_tokens": total_original,
+                "total_compressed_tokens": total_compressed,
+                "savings_pct": savings_pct,
+            },
+        }, indent=2))
+
+    else:
+        close_db(lib)
+        print(json.dumps({"error": f"Unknown subcommand: {subcmd}. Use show|stats|promote|demote"}))
 
 
 async def cmd_window():
@@ -4076,8 +4472,13 @@ async def main():
             remaining = sys.argv[3:] if len(sys.argv) > 3 else []
             await cmd_settings(subcmd, remaining)
 
+        elif cmd == "codebook":
+            subcmd = sys.argv[2] if len(sys.argv) > 2 else None
+            remaining = sys.argv[3:] if len(sys.argv) > 3 else []
+            await cmd_codebook(subcmd, remaining)
+
         else:
-            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|compile|settings|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
+            print(json.dumps({"error": f"Unknown command: {cmd}. Use boot|ingest|recall|remember|correct|profile|compile|settings|codebook|scan|retag|stats|end|topics|window|manifest|schema|history|browse|register-doc|read-doc|docs|suggest-focus|focus-boot|projects|pulse|maintain"}))
             sys.exit(1)
 
     except Exception as e:
