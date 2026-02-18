@@ -12,7 +12,7 @@ If prior messages in this session were not yet ingested, ingest them now before 
 
 ## What This Is
 
-This workspace uses The Librarian, a persistent memory system backed by a local SQLite rolodex. It gives you continuity across conversations — user preferences, project decisions, code patterns, and past discussions survive between sessions.
+This workspace uses The Librarian, a persistent memory system built for Claude on Cowork, backed by a local SQLite rolodex. It gives you continuity across conversations — user preferences, project decisions, code patterns, and past discussions survive between sessions.
 
 ## Always-On Rules
 
@@ -46,7 +46,7 @@ All commands use the `librarian` CLI (installed to PATH).
 
 **Everything. 100% coverage. No cherry-picking.**
 
-Ingest every user message and every assistant response, verbatim. Storage is trivial for a local hard drive. Lossy ingestion is worse than a large corpus — the search layer (user_knowledge boost, categories, ranking) handles surfacing the right things. Cherry-picking at ingestion time loses context that may matter later.
+Ingest every user message and every Claude response, verbatim. Storage is trivial for a local hard drive. Lossy ingestion is worse than a large corpus — the search layer (user_knowledge boost, categories, ranking) handles surfacing the right things. Cherry-picking at ingestion time loses context that may matter later.
 
 Skip only bare acknowledgments with zero informational content ("ok", "thanks", "got it").
 
