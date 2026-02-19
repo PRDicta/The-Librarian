@@ -566,8 +566,8 @@ class Rolodex:
         entry = self.get_entry(entry_id)
         if entry is None or entry.tier == Tier.COLD:
             return None
-        # Never demote user_knowledge entries
-        if entry.category == EntryCategory.USER_KNOWLEDGE:
+        # Never demote privileged-tier entries
+        if entry.category in (EntryCategory.USER_KNOWLEDGE, EntryCategory.PROJECT_KNOWLEDGE):
             return None
         old_tier = entry.tier
         # Update DB
@@ -950,6 +950,40 @@ class Rolodex:
             self._cache_put(entry)
         return entries
 
+    def get_project_knowledge_entries(self, project_filter: Optional[str] = None) -> List[RolodexEntry]:
+        """Fetch all project_knowledge entries, optionally filtered by project tag.
+
+        project_knowledge entries are:
+        - Loaded conditionally at boot (when session involves the relevant project)
+        - Boosted 2x in search results (between user_knowledge 3x and regular 1x)
+        - Never demoted from hot tier
+        - Ideal for: project-specific voice rules, content system rules, Tier 2 constraints
+
+        If project_filter is provided, only entries whose tags contain a matching
+        project identifier are returned. If None, all project_knowledge is returned.
+        """
+        rows = self.conn.execute(
+            """SELECT * FROM rolodex_entries
+               WHERE category = 'project_knowledge'
+               AND superseded_by IS NULL
+               ORDER BY created_at ASC"""
+        ).fetchall()
+        entries = [deserialize_entry(row) for row in rows]
+
+        # Optional project-scope filter: match on tags
+        if project_filter:
+            pf_lower = project_filter.lower()
+            entries = [
+                e for e in entries
+                if any(pf_lower in t.lower() for t in (e.tags or []))
+            ]
+
+        # Always keep in hot cache
+        for entry in entries:
+            entry.tier = Tier.HOT
+            self._cache_put(entry)
+        return entries
+
     def get_behavioral_entries(self) -> List[RolodexEntry]:
         """Fetch all behavioral entries (compressed instruction documents).
 
@@ -1285,16 +1319,19 @@ def _merge_search_results(
         norm_score = score * semantic_weight
         scores[entry.id] = scores.get(entry.id, 0) + norm_score
         entries[entry.id] = entry
-    # Boost user_knowledge entries so they always surface above bulk content
+    # Boost privileged-tier entries so they surface above bulk content
     for eid, entry in entries.items():
         if entry.category.value == "user_knowledge":
             scores[eid] *= USER_KNOWLEDGE_BOOST
+        elif entry.category.value == "project_knowledge":
+            scores[eid] *= PROJECT_KNOWLEDGE_BOOST
 
     # Sort by combined score
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [(entries[eid], score) for eid, score in ranked[:limit]]
 
 USER_KNOWLEDGE_BOOST = 3.0  # user_knowledge entries score 3x higher
+PROJECT_KNOWLEDGE_BOOST = 2.0  # project_knowledge entries score 2x higher
 
 # ─── Chain Serialization (Phase 7) ───────────────────────────────────────────
 

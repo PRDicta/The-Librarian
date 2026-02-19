@@ -27,6 +27,9 @@ class ContextBuilder:
     USER_KNOWLEDGE_HEADER = "═══ USER KNOWLEDGE ═══"
     USER_KNOWLEDGE_FOOTER = "═══ END USER KNOWLEDGE ═══"
 
+    PROJECT_KNOWLEDGE_HEADER = "═══ PROJECT KNOWLEDGE ═══"
+    PROJECT_KNOWLEDGE_FOOTER = "═══ END PROJECT KNOWLEDGE ═══"
+
     BEHAVIORAL_HEADER = "═══ BEHAVIORAL INSTRUCTIONS ═══"
     BEHAVIORAL_FOOTER = "═══ END BEHAVIORAL INSTRUCTIONS ═══"
 
@@ -205,6 +208,29 @@ class ContextBuilder:
             lines.append(self.SEPARATOR)
             lines.append("")
         lines.append(self.USER_KNOWLEDGE_FOOTER)
+        return "\n".join(lines)
+
+    def build_project_knowledge_block(self, entries: list, project_label: str = "") -> str:
+        """Format project_knowledge entries as a conditionally-loaded context block.
+
+        These are project-scoped rules and knowledge that load when the session
+        involves the relevant project. Sits between user_knowledge (always-on)
+        and regular entries (on-demand) in the context hierarchy.
+        """
+        if not entries:
+            return ""
+        header = self.PROJECT_KNOWLEDGE_HEADER
+        if project_label:
+            header = f"═══ PROJECT KNOWLEDGE: {project_label} ═══"
+        lines = [header, ""]
+        for entry in entries:
+            tags_str = ", ".join(entry.tags) if entry.tags else ""
+            if tags_str:
+                lines.append(f"[{tags_str}]")
+            lines.append(entry.content)
+            lines.append(self.SEPARATOR)
+            lines.append("")
+        lines.append(self.PROJECT_KNOWLEDGE_FOOTER)
         return "\n".join(lines)
 
     def build_behavioral_block(self, entries: list) -> str:

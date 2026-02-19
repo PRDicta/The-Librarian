@@ -818,6 +818,11 @@ async def cmd_boot(compact=False, full_context=False):
     uk_entries = lib.rolodex.get_user_knowledge_entries()
     uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
 
+    # ─── Project knowledge: conditionally loaded based on active project ────
+    # Detect active project from user_knowledge entries (heuristic: most-mentioned project tag)
+    pk_entries = lib.rolodex.get_project_knowledge_entries()
+    pk_block = cb.build_project_knowledge_block(pk_entries) if pk_entries else ""
+
     # Serialize profile for structured access (needed early for compression check)
     user_profile_json = {k: v["value"] for k, v in profile.items()} if profile else {}
 
@@ -863,7 +868,7 @@ async def cmd_boot(compact=False, full_context=False):
             except Exception:
                 pass
 
-    fixed_token_cost = estimate_tokens(profile_block + behavioral_block + uk_block)
+    fixed_token_cost = estimate_tokens(profile_block + behavioral_block + uk_block + pk_block)
 
     # Phase 9: Context window state
     window_state = lib.context_window.get_state(lib.state.messages)
@@ -914,7 +919,7 @@ async def cmd_boot(compact=False, full_context=False):
     # ─── Compact boot: fast path ─────────────────────────────────────────
     if compact:
         # Return only the lightweight essentials — no manifest, no instructions
-        preamble_parts = [p for p in [profile_block, behavioral_block, uk_block] if p]
+        preamble_parts = [p for p in [profile_block, behavioral_block, uk_block, pk_block] if p]
         context_block = "\n\n".join(preamble_parts) if preamble_parts else ""
 
         output = {
@@ -926,6 +931,7 @@ async def cmd_boot(compact=False, full_context=False):
             "resumed": resumed,
             "total_entries": stats.get("total_entries", 0),
             "user_knowledge_entries": len(uk_entries),
+            "project_knowledge_entries": len(pk_entries),
             "behavioral_entries": len(behavioral_entries),
             "prompt_compression_enabled": compression_enabled,
             "abbrev_compression_active": abbrev_compression_active,
@@ -1011,7 +1017,7 @@ async def cmd_boot(compact=False, full_context=False):
 
     # ─── Default: full boot (legacy behavior) ────────────────────────────
     # Build final context: profile first, then behavioral (if enabled), then user knowledge, then manifest
-    preamble_parts = [p for p in [profile_block, behavioral_block, uk_block] if p]
+    preamble_parts = [p for p in [profile_block, behavioral_block, uk_block, pk_block] if p]
     if preamble_parts:
         context_block = "\n\n".join(preamble_parts) + "\n\n" + manifest_context if manifest_context else "\n\n".join(preamble_parts)
     else:
@@ -1112,8 +1118,8 @@ def _get_entry_category(cat_str):
         return EntryCategory.NOTE
 
 
-async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, is_summary=False,
-                     doc_id=None, source_location=None):
+async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, as_project_knowledge=False,
+                     is_summary=False, doc_id=None, source_location=None):
     """Ingest a message into the rolodex."""
     lib, _ = _make_librarian()
     _ensure_session(lib, caller="ingest")
@@ -1136,6 +1142,14 @@ async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, i
             lib.rolodex.update_entry_enrichment(
                 entry_id=entry.id,
                 category=_get_entry_category("user_knowledge"),
+            )
+
+    # Handle --project-knowledge flag
+    if as_project_knowledge and entries:
+        for entry in entries:
+            lib.rolodex.update_entry_enrichment(
+                entry_id=entry.id,
+                category=_get_entry_category("project_knowledge"),
             )
 
     # Handle --corrects flag
@@ -1174,6 +1188,8 @@ async def cmd_ingest(role, content, corrects_id=None, as_user_knowledge=False, i
     }
     if as_user_knowledge:
         result["user_knowledge"] = True
+    if as_project_knowledge:
+        result["project_knowledge"] = True
     if doc_id:
         result["document_id"] = doc_id
         if source_location:
@@ -1379,7 +1395,9 @@ async def cmd_end(summary=""):
         profile_block = cb.build_profile_block(profile) if profile else ""
         uk_entries = lib.rolodex.get_user_knowledge_entries()
         uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
-        fixed_cost = estimate_tokens(profile_block + uk_block)
+        pk_entries = lib.rolodex.get_project_knowledge_entries()
+        pk_block = cb.build_project_knowledge_block(pk_entries) if pk_entries else ""
+        fixed_cost = estimate_tokens(profile_block + uk_block + pk_block)
         available_budget = max(0, 20000 - fixed_cost)
 
         mm.refine_manifest(current_manifest, session_id, available_budget)
@@ -1812,6 +1830,54 @@ async def cmd_remember(content):
     }))
 
 
+async def cmd_project_remember(content, project_tag=None):
+    """Ingest content as project_knowledge — project-scoped privileged context.
+
+    project_knowledge entries are:
+    - Loaded conditionally at boot (when session involves the relevant project)
+    - Boosted 2x in search results
+    - Never demoted from hot tier
+    - Ideal for: project-specific voice rules, content system rules, Tier 2 constraints
+
+    If project_tag is provided, it's added to the entry's tags for project-scope filtering.
+    """
+    lib, _ = _make_librarian()
+    _ensure_session(lib, caller="project-remember")
+
+    entries = await lib.ingest("user", content)
+
+    # Recategorize as project_knowledge and promote to hot
+    for entry in entries:
+        lib.rolodex.update_entry_enrichment(
+            entry_id=entry.id,
+            category=_get_entry_category("project_knowledge"),
+        )
+        # Add project tag if specified
+        if project_tag:
+            existing_tags = entry.tags or []
+            if project_tag.lower() not in [t.lower() for t in existing_tags]:
+                existing_tags.append(project_tag)
+                lib.rolodex.update_entry_enrichment(
+                    entry_id=entry.id,
+                    tags=existing_tags,
+                )
+
+    # High-value write — sync back immediately
+    _sync_db_back(lib)
+
+    close_db(lib)
+    result = {
+        "remembered": len(entries),
+        "tier": "project_knowledge",
+        "entry_ids": [e.id for e in entries],
+        "session_id": lib.session_id,
+        "content_preview": content[:120],
+    }
+    if project_tag:
+        result["project_tag"] = project_tag
+    print(json.dumps(result))
+
+
 async def cmd_correct(old_entry_id, corrected_text):
     """Supersede a factually wrong entry with corrected content.
 
@@ -1936,6 +2002,7 @@ ABBREV_EXPANSIONS = {
 ABBREV_VOCAB = [
     # ── Frozen identifiers (never substitute) ──
     (r"\buser[_\s]?knowledge\b", "user_knowledge", "a"),  # preserve as-is
+    (r"\bproject[_\s]?knowledge\b", "project_knowledge", "a"),  # preserve as-is
 
     # ── Multi-word phrase collapses (highest savings: 3-5 word phrases → 1 token abbrev) ──
     (r"\bkey[_\s](?:performance[_\s])?indicators?\b", "KPI", "vi"),
@@ -2129,7 +2196,7 @@ def _extract_and_record_patterns(conn, compressed_text, original_text, entry_ids
     # ── 1. Abbreviation patterns ──────────────────────────────────────────
     # For each ABBREV_VOCAB entry, check if it was applied (replacement exists in text)
     for pattern, replacement, flags in ABBREV_VOCAB:
-        if replacement == "user_knowledge":  # Skip internal marker
+        if replacement in ("user_knowledge", "project_knowledge"):  # Skip internal markers
             continue
         if re.search(r'\b' + re.escape(replacement) + r'\b', compressed_text):
             # Find the original phrase from ABBREV_EXPANSIONS
@@ -3434,7 +3501,9 @@ async def cmd_focus_boot(topic_ids_json):
     profile_block = cb.build_profile_block(profile) if profile else ""
     uk_entries = lib.rolodex.get_user_knowledge_entries()
     uk_block = cb.build_user_knowledge_block(uk_entries) if uk_entries else ""
-    fixed_cost = estimate_tokens(profile_block + uk_block)
+    pk_entries = lib.rolodex.get_project_knowledge_entries()
+    pk_block = cb.build_project_knowledge_block(pk_entries) if pk_entries else ""
+    fixed_cost = estimate_tokens(profile_block + uk_block + pk_block)
     available_budget = max(0, 20000 - fixed_cost)
 
     mm = ManifestManager(lib.rolodex.conn, lib.rolodex)
@@ -4547,6 +4616,7 @@ async def main():
                 sys.exit(1)
             # Parse optional flags
             as_user_knowledge = False
+            as_project_knowledge = False
             corrects_id = None
             is_summary = False
             doc_id = None
@@ -4556,6 +4626,8 @@ async def main():
             while i < len(remaining):
                 if remaining[i] == "--user-knowledge":
                     as_user_knowledge = True
+                elif remaining[i] == "--project-knowledge":
+                    as_project_knowledge = True
                 elif remaining[i] == "--summary":
                     is_summary = True
                 elif remaining[i] == "--corrects" and i + 1 < len(remaining):
@@ -4569,6 +4641,7 @@ async def main():
                     source_location = remaining[i]
                 i += 1
             await cmd_ingest(role, content, corrects_id=corrects_id, as_user_knowledge=as_user_knowledge,
+                             as_project_knowledge=as_project_knowledge,
                              is_summary=is_summary, doc_id=doc_id, source_location=source_location)
 
         elif cmd == "batch-ingest":
@@ -4632,6 +4705,21 @@ async def main():
                 print(json.dumps({"error": "Usage: librarian_cli.py remember \"<fact about the user>\""}))
                 sys.exit(1)
             await cmd_remember(sys.argv[2])
+
+        elif cmd == "project-remember":
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Usage: librarian_cli.py project-remember \"<project-scoped knowledge>\" [--project <tag>]"}))
+                sys.exit(1)
+            pk_content = sys.argv[2]
+            pk_project_tag = None
+            pk_remaining = sys.argv[3:]
+            pk_i = 0
+            while pk_i < len(pk_remaining):
+                if pk_remaining[pk_i] == "--project" and pk_i + 1 < len(pk_remaining):
+                    pk_i += 1
+                    pk_project_tag = pk_remaining[pk_i]
+                pk_i += 1
+            await cmd_project_remember(pk_content, project_tag=pk_project_tag)
 
         elif cmd == "correct":
             if len(sys.argv) < 4:

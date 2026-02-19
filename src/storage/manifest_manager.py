@@ -104,7 +104,7 @@ class ManifestManager:
                       tier, category, topic_id
                FROM rolodex_entries
                WHERE (superseded_by IS NULL OR superseded_by = '')
-               AND category != 'user_knowledge'"""
+               AND category NOT IN ('user_knowledge', 'project_knowledge')"""
         ).fetchall()
 
         if not rows:
@@ -226,7 +226,7 @@ class ManifestManager:
                       tier, category, topic_id
                FROM rolodex_entries
                WHERE (superseded_by IS NULL OR superseded_by = '')
-               AND category != 'user_knowledge'"""
+               AND category NOT IN ('user_knowledge', 'project_knowledge')"""
         ).fetchall()
 
         if not rows:
@@ -342,7 +342,7 @@ class ManifestManager:
                FROM rolodex_entries
                WHERE created_at > ?
                AND (superseded_by IS NULL OR superseded_by = '')
-               AND category != 'user_knowledge'""",
+               AND category NOT IN ('user_knowledge', 'project_knowledge')""",
             (previous.updated_at.isoformat(),)
         ).fetchall()
 
@@ -472,7 +472,7 @@ class ManifestManager:
                FROM rolodex_entries
                WHERE conversation_id = ?
                AND (superseded_by IS NULL OR superseded_by = '')
-               AND category != 'user_knowledge'""",
+               AND category NOT IN ('user_knowledge', 'project_knowledge')""",
             (session_id,)
         ).fetchall()
 
@@ -624,7 +624,7 @@ class ManifestManager:
             """SELECT COUNT(*) FROM rolodex_entries
                WHERE created_at > ?
                AND (superseded_by IS NULL OR superseded_by = '')
-               AND category != 'user_knowledge'""",
+               AND category NOT IN ('user_knowledge', 'project_knowledge')""",
             (after.isoformat(),)
         ).fetchone()
         return row[0] if row else 0

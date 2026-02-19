@@ -9,9 +9,18 @@ import struct
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
 from ..core.types import (
     RolodexEntry, ContentModality, EntryCategory, Tier
 )
+
+def _safe_enum(enum_cls: type, value: str, default):
+    """Convert a string to an enum value, returning default if not valid."""
+    try:
+        return enum_cls(value)
+    except (ValueError, KeyError):
+        return default
+
 # ─── Schema SQL ──────────────────────────────────────────────────────────────
 SCHEMA_SQL = """
 -- Core rolodex entries: every piece of indexed content
@@ -360,8 +369,8 @@ def deserialize_entry(row: sqlite3.Row) -> RolodexEntry:
         id=row["id"],
         conversation_id=row["conversation_id"],
         content=row["content"],
-        content_type=ContentModality(row["content_type"]),
-        category=EntryCategory(row["category"]),
+        content_type=_safe_enum(ContentModality, row["content_type"], ContentModality.PROSE),
+        category=_safe_enum(EntryCategory, row["category"], EntryCategory.NOTE),
         tags=json.loads(row["tags"]),
         source_range=json.loads(row["source_range"]),
         access_count=row["access_count"],

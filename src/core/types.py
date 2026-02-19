@@ -21,6 +21,8 @@ class ContentModality(Enum):
     CONVERSATIONAL = "conversational"
     STRUCTURED = "structured"
     MIXED = "mixed"
+    INSIGHT = "insight"
+    USER_KNOWLEDGE = "user_knowledge"
 class EntryCategory(Enum):
     DEFINITION = "definition"
     EXAMPLE = "example"
@@ -36,9 +38,12 @@ class EntryCategory(Enum):
     CORRECTION = "correction"      # Something was wrong and got fixed
     FRICTION = "friction"          # A struggle, confusion, or difficulty
     BREAKTHROUGH = "breakthrough"  # A moment of clarity or success
+    FACTUAL_KNOWLEDGE = "factual_knowledge"  # General factual information
     PIVOT = "pivot"                # A change of direction or approach
     # Privileged tier — persistent user facts
     USER_KNOWLEDGE = "user_knowledge"
+    # Privileged tier — project-scoped knowledge (conditional loading)
+    PROJECT_KNOWLEDGE = "project_knowledge"
     # Privileged tier — compressed behavioral instructions
     BEHAVIORAL = "behavioral"
 class CompressionStage(Enum):
