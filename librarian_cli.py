@@ -602,7 +602,7 @@ def _sync_db_back(lib=None, force=False):
 
 # Track ingestion count for periodic sync-back
 _ingest_since_last_sync = 0
-SYNC_BACK_INTERVAL = 10  # Sync back to mount every N ingestions
+SYNC_BACK_INTERVAL = 1  # Sync back to mount after every ingestion
 
 
 def save_session_id(session_id):
@@ -749,6 +749,56 @@ def _load_instructions():
                 continue
 
     return None
+
+
+def _get_operations_block():
+    """Return operational instructions injected at boot.
+
+    These rules tell the LLM how to use The Librarian during a session.
+    Previously lived in CLAUDE.md where they were often ignored.
+    Now delivered directly in boot output so they're always present.
+    """
+    return """═══ LIBRARIAN OPERATIONS ═══
+
+ALWAYS-ON RULES:
+- Every message (if 2+ min since last): Run `pulse` first. Only re-boot if `needs_boot` is true.
+- Every message: Ingest both user and assistant messages separately. Verbatim — no summarizing.
+  Skip only bare acknowledgments ("ok", "thanks", "got it").
+- After compaction or continuation: Re-boot immediately. The Librarian does not carry over.
+- When past context would help: Use `recall` before responding.
+- When the user states a fact about themselves: Use `remember` automatically.
+- When the user goes idle (5+ min): Run `maintain` in the background.
+- When revising a factual claim: Use `correct` or `--corrects` to supersede the old entry.
+
+COMMANDS (all via: python /sessions/*/mnt/The\\ Librarian/librarian/librarian_cli.py):
+- boot [--compact|--full-context] — Start/resume session.
+- pulse — Sub-second heartbeat. Returns {alive, needs_boot}.
+- ingest user "msg" / ingest assistant "msg" — Save content. Flags: --user-knowledge, --corrects <id>.
+- remember "fact" — Store privileged user fact. 3x boost, never demoted.
+- recall "topic" — Retrieve relevant past context.
+- correct <old_id> "text" — Supersede a wrong entry.
+- profile set/show/delete — Manage user preferences.
+- end "summary" — Close session with summary.
+- maintain — Background KG hygiene. Use during idle.
+- compile [--abbreviate] — Store compressed behavioral YAML.
+- codebook show/promote/stats — Manage compression patterns.
+- browse recent N --json — View recent entries (always echo results in chat).
+
+INGESTION RULES:
+- 100% coverage. Storage is trivial. The search layer handles relevance.
+- Verbatim means verbatim. Paste exact message text. No paraphrasing.
+- If a message is long, ingest it in full.
+
+CORRECTIONS VS. REASONING CHAINS:
+- Factual error (wrong name, wrong path) → use `correct` to supersede.
+- Design decision change (rename, pivot) → do NOT supersede. Keep both entries.
+
+TEMPORAL GROUNDING:
+- Check age of recalled entries before asserting them as current truth.
+- If older than 24h, note the age and verify before presenting as fact.
+- If recall results carry [STALE], treat as leads to investigate.
+
+═══ END LIBRARIAN OPERATIONS ═══"""
 
 
 def _check_for_update():
@@ -916,6 +966,9 @@ async def cmd_boot(compact=False, full_context=False):
             "Ingestion uses heuristic extraction instead of LLM-enhanced summarization."
         )
 
+    # ─── Operational instructions (always included) ─────────────────────
+    operations_block = _get_operations_block()
+
     # ─── Compact boot: fast path ─────────────────────────────────────────
     if compact:
         # Return only the lightweight essentials — no manifest, no instructions
@@ -950,6 +1003,8 @@ async def cmd_boot(compact=False, full_context=False):
                 "bridge_summary": bridge if bridge else None,
             },
         }
+
+        output["operations"] = operations_block
 
         if warnings:
             output["warnings"] = warnings
@@ -1059,6 +1114,7 @@ async def cmd_boot(compact=False, full_context=False):
         },
     }
 
+    output["operations"] = operations_block
     if instructions_block:
         output["instructions"] = instructions_block
     if update_info:
