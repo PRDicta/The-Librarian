@@ -2,6 +2,24 @@
 
 If The Librarian was useful to you, please consider [buying me a drink](https://buymeacoffee.com/chief_librarian).
 
+## v1.3.1 — Boot Crash Fix (2026-07-08)
+
+Fixes a `NameError` on boot that affected every default boot in v1.3.0.
+
+### Fixed
+
+- **Boot crash (`emoji_compression_active`).** The default (full) boot path
+  referenced an uninitialized `emoji_compression_active` flag, raising a
+  `NameError` before boot could return. This fired on every standard `boot`
+  regardless of compression settings; only the `--compact` and
+  `--full-context` sub-modes were unaffected. The flag is now initialized and
+  tracked independently from the abbreviation-compression flag, and both
+  flags are reported consistently across all boot modes.
+
+Thanks to **PennyPineappleRain** for the detailed report and the fix.
+
+---
+
 ## v1.3.0 — Scheduled Tasks & Automation (2026-03-04)
 
 Adds first-class scheduled task support, enabling automated maintenance
