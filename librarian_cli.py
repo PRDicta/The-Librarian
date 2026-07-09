@@ -879,6 +879,7 @@ async def cmd_boot(compact=False, full_context=False):
     # Prompt compression: load behavioral entries if enabled
     compression_enabled = user_profile_json.get('prompt_compression', '').lower() == 'on'
     abbrev_compression_active = False
+    emoji_compression_active = False
     behavioral_entries = []
     behavioral_block = ""
     if compression_enabled:
@@ -892,8 +893,11 @@ async def cmd_boot(compact=False, full_context=False):
                 ).fetchone()
                 if row and row[0]:
                     be_meta = json.loads(row[0])
-                    if be_meta.get("abbrev_compression") or be_meta.get("emoji_compression"):
+                    if be_meta.get("abbrev_compression"):
                         abbrev_compression_active = True
+                    if be_meta.get("emoji_compression"):
+                        emoji_compression_active = True
+                    if abbrev_compression_active and emoji_compression_active:
                         break
             except Exception:
                 pass
@@ -988,6 +992,7 @@ async def cmd_boot(compact=False, full_context=False):
             "behavioral_entries": len(behavioral_entries),
             "prompt_compression_enabled": compression_enabled,
             "abbrev_compression_active": abbrev_compression_active,
+            "emoji_compression_active": emoji_compression_active,
             "codebook_vocab_loaded": codebook_loaded,
             "codebook_usage_tracked": codebook_usage_updated,
             "past_sessions": len(past_sessions),
@@ -1099,6 +1104,7 @@ async def cmd_boot(compact=False, full_context=False):
         "user_knowledge_entries": len(uk_entries),
         "behavioral_entries": len(behavioral_entries),
         "prompt_compression_enabled": compression_enabled,
+        "abbrev_compression_active": abbrev_compression_active,
         "emoji_compression_active": emoji_compression_active,
         "past_sessions": len(past_sessions),
         "user_profile": user_profile_json,
