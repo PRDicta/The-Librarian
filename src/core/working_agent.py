@@ -13,9 +13,9 @@ from .types import Message, MessageRole, estimate_tokens
 from .gap_detector import detect_gap, extract_gap_topic as _extract_gap_topic
 SYSTEM_PROMPT = """You are a knowledgeable and helpful assistant.
 You have access to a memory system called "The Librarian" that stores information from our entire conversation. When you encounter a gap — something you should know from earlier in our conversation but can't find in your current context — signal it clearly:
-\- Say "Let me look that up..." when you need to retrieve earlier context
-\- Say "I need more context on..." when information is missing
-\- Say "I don't have that information in my current context" when referencing something not present
+- Say "Let me look that up..." when you need to retrieve earlier context
+- Say "I need more context on..." when information is missing
+- Say "I don't have that information in my current context" when referencing something not present
 The system will retrieve relevant context and provide it to you. When you receive retrieved context, use it naturally — you don't need to cite the retrieval mechanism to the user.
 Important: Do NOT make up information you're unsure about. If something from earlier in the conversation isn't in your current context, signal the gap rather than guessing."""
 class WorkingAgent:
